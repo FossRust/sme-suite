@@ -20,9 +20,10 @@ enum Task {
     Table,
     Id,
     Title,
-    Notes,
+    NotesMd,
     Status,
     Priority,
+    Assignee,
     DueAt,
     CompletedAt,
     CompanyId,
@@ -122,8 +123,8 @@ impl MigrationTrait for Migration {
                     .table(Task::Table)
                     .if_not_exists()
                     .col(&mut uuid_pk(Task::Id))
-                    .col(ColumnDef::new(Task::Title).string_len(512).not_null())
-                    .col(ColumnDef::new(Task::Notes).text())
+                    .col(ColumnDef::new(Task::Title).string_len(256).not_null())
+                    .col(ColumnDef::new(Task::NotesMd).text())
                     .col(
                         ColumnDef::new(Task::Status)
                             .string_len(32)
@@ -136,6 +137,7 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(Expr::cust("'MEDIUM'")),
                     )
+                    .col(ColumnDef::new(Task::Assignee).string_len(256))
                     .col(ColumnDef::new(Task::DueAt).timestamp_with_time_zone())
                     .col(ColumnDef::new(Task::CompletedAt).timestamp_with_time_zone())
                     .col(ColumnDef::new(Task::CompanyId).uuid())
@@ -199,27 +201,30 @@ impl MigrationTrait for Migration {
         manager
             .create_index(
                 Index::create()
-                    .name("idx_task_company")
+                    .name("idx_task_company_due")
                     .table(Task::Table)
                     .col(Task::CompanyId)
+                    .col(Task::DueAt)
                     .to_owned(),
             )
             .await?;
         manager
             .create_index(
                 Index::create()
-                    .name("idx_task_contact")
+                    .name("idx_task_contact_due")
                     .table(Task::Table)
                     .col(Task::ContactId)
+                    .col(Task::DueAt)
                     .to_owned(),
             )
             .await?;
         manager
             .create_index(
                 Index::create()
-                    .name("idx_task_deal")
+                    .name("idx_task_deal_due")
                     .table(Task::Table)
                     .col(Task::DealId)
+                    .col(Task::DueAt)
                     .to_owned(),
             )
             .await?;

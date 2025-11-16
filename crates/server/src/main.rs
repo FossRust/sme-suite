@@ -2,6 +2,7 @@ use api::schema::{build_schema, AppSchema};
 use async_graphql::{http::GraphiQLSource, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{routing::get, Router};
+use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
 use migration::{Migrator, MigratorTrait};
@@ -165,7 +166,7 @@ async fn shutdown_signal() {
 }
 
 async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
-    use entity::{company, contact, deal};
+    use entity::{company, contact, deal, task};
     use sea_orm::{ActiveModelTrait, Set};
     let acme = company::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -177,7 +178,7 @@ async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
     .insert(db)
     .await?;
 
-    let _ = contact::ActiveModel {
+    let ada = contact::ActiveModel {
         id: Set(Uuid::new_v4()),
         email: Set("ada@acme.test".into()),
         first_name: Set(Some("Ada".into())),
@@ -223,5 +224,60 @@ async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
     )
     .await
     .map_err(|err| anyhow::anyhow!("seed stage change failed: {:?}", err))?;
+
+    let now = Utc::now();
+    let open_due = now + Duration::days(7);
+    task::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("Schedule kickoff call".into()),
+        notes_md: Set(Some("Prepare deck with milestones.".into())),
+        status: Set(task::Status::Open),
+        priority: Set(task::Priority::High),
+        assignee: Set(Some("pm@acme.test".into())),
+        due_at: Set(Some(open_due.into())),
+        completed_at: Set(None),
+        company_id: Set(Some(acme.id)),
+        contact_id: Set(None),
+        deal_id: Set(None),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
+
+    let done_due = now - Duration::days(3);
+    task::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("Send proposal".into()),
+        notes_md: Set(Some("Proposal approved internally.".into())),
+        status: Set(task::Status::Done),
+        priority: Set(task::Priority::Medium),
+        assignee: Set(Some("sales@acme.test".into())),
+        due_at: Set(Some(done_due.into())),
+        completed_at: Set(Some((now - Duration::days(1)).into())),
+        company_id: Set(None),
+        contact_id: Set(None),
+        deal_id: Set(Some(inserted.id)),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
+
+    task::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("Reschedule intro".into()),
+        notes_md: Set(Some("Waiting on contact availability.".into())),
+        status: Set(task::Status::Cancelled),
+        priority: Set(task::Priority::Low),
+        assignee: Set(None),
+        due_at: Set(None),
+        completed_at: Set(None),
+        company_id: Set(None),
+        contact_id: Set(Some(ada.id)),
+        deal_id: Set(None),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
+
     Ok(())
 }

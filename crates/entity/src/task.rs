@@ -6,9 +6,10 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: Uuid,
     pub title: String,
-    pub notes: Option<String>,
+    pub notes_md: Option<String>,
     pub status: Status,
     pub priority: Priority,
+    pub assignee: Option<String>,
     pub due_at: Option<DateTimeWithTimeZone>,
     pub completed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(indexed)]
