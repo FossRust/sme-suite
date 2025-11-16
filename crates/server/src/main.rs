@@ -51,7 +51,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let db_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => "postgres://sme_suite:sme_suite@localhost:5432/sme_suite".to_string(),
+    };
     let db = Arc::new(Database::connect(&db_url).await?);
 
     match cli.cmd {
