@@ -1,9 +1,0 @@
-[package]
-name = "products-crm"
-version = "0.1.0"
-edition = "2021"
-description = "CRM vertical slice"
-
-[dependencies]
-serde.workspace = true
-thiserror.workspace = true
