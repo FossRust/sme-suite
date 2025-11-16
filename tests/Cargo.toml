@@ -15,7 +15,6 @@ sea-orm-migration.workspace = true
 testcontainers = "0.15"
 tokio.workspace = true
 uuid.workspace = true
-migration = { path = "../migration" }
 
 [[test]]
 name = "rls_isolation"

@@ -15,7 +15,6 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 entity.workspace = true
-migration = { path = "../migration" }
 openidconnect.workspace = true
 platform-authn = { path = "../platform/authn" }
 platform-api.workspace = true

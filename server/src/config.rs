@@ -7,9 +7,6 @@ use platform_authn::ProviderConfig;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
-    pub single_tenant: bool,
-    pub default_org_slug: String,
-    pub default_org_name: String,
     pub cookie_key: Key,
     pub cors_allowed_origins: Vec<String>,
     pub providers: HashMap<String, ProviderConfig>,
@@ -17,16 +14,6 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn load() -> Result<Self> {
-        let single_tenant = std::env::var("SINGLE_TENANT")
-            .ok()
-            .map(|val| matches!(val.to_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(true);
-
-        let default_org_slug =
-            std::env::var("DEFAULT_ORG_SLUG").unwrap_or_else(|_| "default".into());
-        let default_org_name =
-            std::env::var("DEFAULT_ORG_NAME").unwrap_or_else(|_| "Default".into());
-
         let cookie_secret =
             std::env::var("COOKIE_SECRET_BASE64").context("COOKIE_SECRET_BASE64 missing")?;
         let secret_bytes = STANDARD
@@ -77,9 +64,6 @@ impl AppConfig {
         }
 
         Ok(Self {
-            single_tenant,
-            default_org_slug,
-            default_org_name,
             cookie_key,
             cors_allowed_origins,
             providers,

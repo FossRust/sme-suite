@@ -5,7 +5,6 @@ members = [
   "platform/api",
   "platform/db",
   "platform/obs",
-  "migration",
   "server",
   "tests",
 ]

@@ -1,11 +1,9 @@
-//! Database primitives: pooled connections plus tenant-aware helpers.
-
+//! Database primitives: pooled connections
 use chrono::Utc;
 use entity::{memberships, orgs, users};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectOptions, ConnectionTrait, Database, DatabaseBackend,
-    DatabaseConnection, DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter, Set,
-    Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, Set,
 };
 use serde::Deserialize;
 use thiserror::Error;
@@ -73,28 +71,6 @@ pub async fn connect(settings: &DatabaseSettings) -> DbResult<DbPool> {
     opts.max_connections(settings.max_connections());
     opts.sqlx_logging(false);
     Database::connect(opts).await.map_err(DbError::from)
-}
-
-/// Acquire a transaction after setting the tenant context (session-level GUC).
-pub async fn with_tenant(pool: &DbPool, org: Uuid) -> DbResult<DatabaseTransaction> {
-    let mut tx = pool.begin().await?;
-    set_tenant(&mut tx, org, false).await?;
-    Ok(tx)
-}
-
-/// Begin a tenant-scoped transaction (uses `SET LOCAL` semantics).
-pub async fn begin_tenant_tx(pool: &DbPool, org: Uuid) -> DbResult<DatabaseTransaction> {
-    let mut tx = pool.begin().await?;
-    set_tenant(&mut tx, org, true).await?;
-    Ok(tx)
-}
-
-async fn set_tenant(conn: &mut DatabaseTransaction, org: Uuid, local_only: bool) -> DbResult<()> {
-    let scope = if local_only { "true" } else { "false" };
-    let stmt = format!("SELECT set_config('app.tenant_id', '{org}', {scope})");
-    conn.execute(Statement::from_string(DatabaseBackend::Postgres, stmt))
-        .await?;
-    Ok(())
 }
 
 /// Ensure an organization exists for the provided slug; returns its ID.
