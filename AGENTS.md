@@ -1,22 +1,25 @@
 # Repository Guidelines
 
+## Product Vision & Scope
+The suite is open-core for SMEs, optimized for high performance and low resource usage by staying 100% Rust. As laid out in `docs/research/plan.md` and `docs/research/codex-workflow.md`, CRM and HR launch first through a single `suite-server` binary (GraphQL + CLI).
+
 ## Project Structure & Module Organization
-Planning artifacts live under `codex/`: `tasks/*.yml` outline the incremental backlog, and `prompts/header.md` captures reusable instruction blocks for future agents. All research, architecture notes, and requirements (including the recommended Axum + SeaORM layout) are in `docs/research/`. When the Rust workspace is created, mirror the structure proposed in `docs/research/plan.md`—`src/db`, `src/graphql`, `src/auth`, and `src/routes`—so the CRM, HR, and accounting domains stay cleanly separated.
+Follow the blueprint in `docs/research/codex-workflow.md`: `apps/suite-server` for Axum/async-graphql entrypoints, `platform/*` for reusable crates (authn, authz/Cedar, db, billing), `products/{crm,hr}` for domain logic, and `frontend/` for the Dioxus hub with lazy CRM/HR bundles. Align new modules (`db/entities`, `graphql/queries`, OIDC middleware) with the SeaORM and Postgres patterns captured in the research notes.
 
 ## Build, Test, and Development Commands
-- `cargo check` then `cargo build --workspace`: verify the entire Axum/async-graphql stack compiles; use `--workspace` once multiple crates exist.
-- `DATABASE_URL=postgres://... cargo run --bin server`: boot the API locally on `0.0.0.0:8080` as envisioned in the plan.
-- `cargo fmt && cargo clippy --all-targets --all-features`: formatting plus lint coverage before every commit.
-- `cargo test --workspace -- --nocapture`: execute resolver, SeaORM, and integration suites; keep output visible for async debugging.
+- `cargo check && cargo build --workspace`: compile every crate before committing.
+- `DATABASE_URL=postgres://... cargo run -p suite-server -- serve --dry-run`: start the binary locally (defaults to `0.0.0.0:8080`).
+- `sea-orm-cli migrate refresh && cargo test` (or `sqlx migrate run` if raw SQL migrations are chosen): keeps schema + code synchronized with RLS.
+- `cargo fmt && cargo clippy --all-targets --all-features`: formatting + linting gate prior to PRs.
 
 ## Coding Style & Naming Conventions
-Default to four-space indentation and `rustfmt` output. Prefer `snake_case` for functions/modules, `PascalCase` for types, and `SCREAMING_SNAKE_CASE` for env constants. Organize Axum routers in `routes/mod.rs`, GraphQL queries/mutations/types under `graphql/`, and SeaORM entities in `db/entities`. Introduce submodules by CRM concept (contacts, deals, payroll) and keep files under 300 lines to match the modular approach described in the research documents.
+Use four-space indentation and `rustfmt`. Stick to `snake_case` for functions/modules, `PascalCase` for types, and `SCREAMING_SNAKE_CASE` for env vars. Name crates by responsibility (`platform::authn`, `products::hr::timesheets`) and keep Axum routers under `routes/`, GraphQL objects in `graphql/`, and SeaORM entities in `db/entities`.
 
 ## Testing Guidelines
-Unit tests live alongside modules (`mod tests`) while integration tests belong in `tests/`. Use `async-graphql` request tests plus SeaORM fixture builders to cover GraphQL flows and data access. When editing migrations, run `sea-orm-cli migrate fresh && cargo test` to ensure RLS and tenant constraints behave. Snapshot GraphQL schemas whenever mutation contracts change and update `docs/research/codex-workflow.md` with new scenarios.
+Work spec-first as suggested in `docs/research/codex-workflow.md`, keeping unit tests beside source and integration tests under `tests/`. Exercise GraphQL paths with `async-graphql` request tests plus SeaORM fixtures, rerun migrations in CI, enforce RLS behavior with Postgres/testcontainers suites, and snapshot `schema.graphql` whenever contracts change. Track performance budgets through the lightweight load targets described in the docs.
 
 ## Commit & Pull Request Guidelines
-The Git log currently consists of short imperative statements (“Initial commit”, “add initial tasks”); continue that tone and add scopes when helpful (`db: add contact entities`). Reference the relevant `codex/tasks` identifier or GitHub issue in the body. Pull requests should summarize architectural impact, note touched directories, include `cargo test` results, and attach screenshots or schema diffs if the GraphQL surface shifts.
+Continue the short, imperative commits already in `git log`, optionally scoping (`hr: add leave policy RLS`). Reference `codex/tasks/<id>.yml` or linked issues, summarize CRM vs HR impact, and attach `cargo test`/lint output. PRs should be atomic so each Codex work order remains reviewable and should include schema diffs or screenshots if UI/GraphQL behavior changes.
 
 ## Security & Configuration Tips
-Never commit `.env`. Load `DATABASE_URL`, `JWT_AUDIENCE`, issuer URLs, and signing keys via `dotenvy` or launch scripts, and document any temporary defaults inside `docs/research/codex-workflow.md`. Middleware should deny-by-default; when creating health or auth callback routes, explain the reasoning in the PR to keep reviewers aware of exposure.
+Store OIDC secrets, Cedar policy seeds, and billing keys outside git (loading via `.env`); document the variables inside `docs/research/codex-workflow.md`. Middleware must default to deny-by-default, GraphQL resolvers should call `authz.check()`, and any public routes (health, login callback) need justification inside the PR. Always verify tenant isolation when adding CRM or HR entities to keep the open-core promise credible.

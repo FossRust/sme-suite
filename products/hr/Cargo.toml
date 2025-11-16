@@ -1,0 +1,9 @@
+[package]
+name = "products-hr"
+version = "0.1.0"
+edition = "2021"
+description = "HR vertical slice"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "platform-db"
+version = "0.1.0"
+edition = "2021"
+description = "Database configuration helpers"
+
+[dependencies]
+anyhow.workspace = true
+sea-orm.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

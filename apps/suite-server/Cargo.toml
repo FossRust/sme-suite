@@ -1,0 +1,23 @@
+[package]
+name = "suite-server"
+version = "0.1.0"
+edition = "2021"
+authors = ["Fossrust Contributors"]
+description = "Axum + async-graphql service binary for the SME suite"
+
+[dependencies]
+anyhow.workspace = true
+async-graphql.workspace = true
+async-graphql-axum.workspace = true
+axum.workspace = true
+clap.workspace = true
+platform-authn.workspace = true
+platform-authz.workspace = true
+platform-db.workspace = true
+products-crm.workspace = true
+products-hr.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

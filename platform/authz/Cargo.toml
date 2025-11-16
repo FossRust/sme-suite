@@ -1,0 +1,9 @@
+[package]
+name = "platform-authz"
+version = "0.1.0"
+edition = "2021"
+description = "Cedar-backed authorization facade"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

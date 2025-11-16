@@ -1,11 +1,11 @@
 # FossRust Suite — Global Constraints (read before coding)
 
 ## Stack (Rust, single binary)
-- Rust stable (≥ 1.80), edition 2021.
-- Web: axum ^0.7, tower, tower-http.
+- Rust stable (≥ 1.91), edition 2025.
+- Web: axum ^0.8, tower, tower-http.
 - GraphQL: async-graphql ^7, async-graphql-axum ^7.
-- DB: Postgres 14+, sqlx ^0.7 (runtime=tokio, tls=rustls), sqlx::migrate!.
-- AuthN: openidconnect ^3, reqwest ^0.12 (rustls).
+- DB: Postgres 18+, sqlx ^0.8 (runtime=tokio, tls=rustls), sqlx::migrate!.
+- AuthN: openidconnect ^4, reqwest ^0.12 (rustls).
 - AuthZ: (placeholder for Cedar), not part of first 3 tasks.
 - Observability: tracing ^0.1, tracing-subscriber ^0.3, opentelemetry-otlp.
 - CLI: clap ^4.5.
@@ -47,4 +47,3 @@ Do NOT:
 - Introduce extra services.
 - Hardcode secrets; use env/config only.
 - Change license or workspace layout.
-

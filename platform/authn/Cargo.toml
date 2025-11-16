@@ -1,0 +1,9 @@
+[package]
+name = "platform-authn"
+version = "0.1.0"
+edition = "2021"
+description = "OIDC and session helpers for the SME suite"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
