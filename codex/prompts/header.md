@@ -1,7 +1,7 @@
 # FossRust Suite — Global Constraints (read before coding)
 
 ## Stack (Rust, single binary)
-- Rust stable (≥ 1.91), edition 2025.
+- Rust stable (≥ 1.91), edition 2024.
 - Web: axum ^0.8, tower, tower-http.
 - GraphQL: async-graphql ^7, async-graphql-axum ^7.
 - DB: Postgres 18+, sqlx ^0.8 (runtime=tokio, tls=rustls), sqlx::migrate!.

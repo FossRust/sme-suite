@@ -1,12 +1,11 @@
 [package]
 name = "platform-db"
 version = "0.1.0"
-edition = "2021"
-description = "Database configuration helpers"
+edition = "2024"
+description = "Database primitives (pools, config)"
+publish = false
 
 [dependencies]
-anyhow.workspace = true
-sea-orm.workspace = true
 serde.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
