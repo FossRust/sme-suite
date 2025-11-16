@@ -17,7 +17,7 @@ use tracing::{info, Level};
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
-#[command(name = "fossrust-crm-suite", version)]
+#[command(name = "fossrust-sme-suite", version)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
