@@ -6,6 +6,9 @@ description = "Database primitives (pools, config)"
 publish = false
 
 [dependencies]
+entity.workspace = true
+chrono.workspace = true
 serde.workspace = true
-sqlx.workspace = true
+sea-orm.workspace = true
 thiserror.workspace = true
+uuid.workspace = true

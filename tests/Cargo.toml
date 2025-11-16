@@ -1,0 +1,22 @@
+[package]
+name = "suite-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dev-dependencies]
+anyhow.workspace = true
+platform-db.workspace = true
+sea-orm.workspace = true
+sea-orm-migration.workspace = true
+testcontainers = "0.15"
+tokio.workspace = true
+uuid.workspace = true
+migration = { path = "../migration" }
+
+[[test]]
+name = "rls_isolation"
+path = "rls_isolation.rs"
