@@ -198,17 +198,27 @@ async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
     .insert(db)
     .await?;
 
-    let _ = deal::ActiveModel {
+    let inserted = deal::ActiveModel {
         id: Set(Uuid::new_v4()),
         title: Set("ACME Pilot".into()),
         amount_cents: Set(Some(120_000)),
         currency: Set(Some("USD".into())),
-        stage: Set(deal::Stage::Qualify),
+        stage: Set(deal::Stage::New),
         close_date: Set(None),
         company_id: Set(acme.id),
         ..Default::default()
     }
     .insert(db)
     .await?;
+
+    api::schema::move_deal_stage_service(
+        db,
+        inserted.id,
+        deal::Stage::Qualify,
+        Some("Qualified via discovery".into()),
+        Some("seed".into()),
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("seed stage change failed: {:?}", err))?;
     Ok(())
 }

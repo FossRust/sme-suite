@@ -47,19 +47,25 @@ pub enum Relation {
 }
 
 impl Related<super::company::Entity> for Entity {
-    fn to() -> RelationDef { Relation::Company.def() }
+    fn to() -> RelationDef {
+        Relation::Company.def()
+    }
 }
 
 impl Related<super::contact::Entity> for Entity {
-    fn to() -> RelationDef { Relation::Contact.def() }
+    fn to() -> RelationDef {
+        Relation::Contact.def()
+    }
 }
 
 impl Related<super::deal::Entity> for Entity {
-    fn to() -> RelationDef { Relation::Deal.def() }
+    fn to() -> RelationDef {
+        Relation::Deal.def()
+    }
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveActiveEnum, Eq, PartialEq)]
-#[sea_orm(rs_type = "String", db_type = "String")]
+#[sea_orm(rs_type = "String", db_type = "String(Some(32))")]
 pub enum Status {
     #[sea_orm(string_value = "OPEN")]
     Open,
@@ -70,7 +76,7 @@ pub enum Status {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveActiveEnum, Eq, PartialEq)]
-#[sea_orm(rs_type = "String", db_type = "String")]
+#[sea_orm(rs_type = "String", db_type = "String(Some(32))")]
 pub enum Priority {
     #[sea_orm(string_value = "LOW")]
     Low,

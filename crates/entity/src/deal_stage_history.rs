@@ -7,10 +7,11 @@ pub struct Model {
     pub id: Uuid,
     #[sea_orm(indexed)]
     pub deal_id: Uuid,
-    pub from_stage: Option<super::deal::Stage>,
+    pub from_stage: super::deal::Stage,
     pub to_stage: super::deal::Stage,
     pub changed_at: DateTimeWithTimeZone,
     pub note: Option<String>,
+    pub changed_by: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -25,7 +26,9 @@ pub enum Relation {
 }
 
 impl Related<super::deal::Entity> for Entity {
-    fn to() -> RelationDef { Relation::Deal.def() }
+    fn to() -> RelationDef {
+        Relation::Deal.def()
+    }
 }
 
 impl ActiveModelBehavior for ActiveModel {}

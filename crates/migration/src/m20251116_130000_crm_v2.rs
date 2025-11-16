@@ -1,23 +1,21 @@
 use sea_orm_migration::prelude::*;
 use sea_query::SimpleExpr;
 
-#[derive(DeriveIden)]
+#[derive(DeriveIden, Copy, Clone)]
 enum Activity {
     Table,
     Id,
+    EntityType,
+    EntityId,
     Kind,
-    Direction,
     Subject,
-    Body,
-    At,
-    CompanyId,
-    ContactId,
-    DealId,
+    BodyMd,
+    MetaJson,
     CreatedAt,
-    UpdatedAt,
+    CreatedBy,
 }
 
-#[derive(DeriveIden)]
+#[derive(DeriveIden, Copy, Clone)]
 enum Task {
     Table,
     Id,
@@ -34,7 +32,7 @@ enum Task {
     UpdatedAt,
 }
 
-#[derive(DeriveIden)]
+#[derive(DeriveIden, Copy, Clone)]
 enum DealStageHistory {
     Table,
     Id,
@@ -43,21 +41,22 @@ enum DealStageHistory {
     ToStage,
     ChangedAt,
     Note,
+    ChangedBy,
 }
 
-#[derive(DeriveIden)]
+#[derive(DeriveIden, Copy, Clone)]
 enum Company {
     Table,
     Id,
 }
 
-#[derive(DeriveIden)]
+#[derive(DeriveIden, Copy, Clone)]
 enum Contact {
     Table,
     Id,
 }
 
-#[derive(DeriveIden)]
+#[derive(DeriveIden, Copy, Clone)]
 enum Deal {
     Table,
     Id,
@@ -74,60 +73,55 @@ impl MigrationTrait for Migration {
                 Table::create()
                     .table(Activity::Table)
                     .if_not_exists()
-                    .col(uuid_pk(Activity::Id))
-                    .col(ColumnDef::new(Activity::Kind).string_len(32).not_null())
-                    .col(ColumnDef::new(Activity::Direction).string_len(32))
-                    .col(ColumnDef::new(Activity::Subject).string_len(512))
-                    .col(ColumnDef::new(Activity::Body).text())
+                    .col(&mut uuid_pk(Activity::Id))
                     .col(
-                        ColumnDef::new(Activity::At)
-                            .timestamp_with_time_zone()
+                        ColumnDef::new(Activity::EntityType)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Activity::EntityId).uuid().not_null())
+                    .col(ColumnDef::new(Activity::Kind).string_len(32).not_null())
+                    .col(ColumnDef::new(Activity::Subject).string_len(512))
+                    .col(ColumnDef::new(Activity::BodyMd).text())
+                    .col(
+                        ColumnDef::new(Activity::MetaJson)
+                            .json_binary()
                             .not_null()
-                            .default(Expr::cust("now()")),
+                            .default(Expr::cust("'{}'::jsonb")),
                     )
-                    .col(ColumnDef::new(Activity::CompanyId).uuid())
-                    .col(ColumnDef::new(Activity::ContactId).uuid())
-                    .col(ColumnDef::new(Activity::DealId).uuid())
-                    .col(timestamp_with_default(Activity::CreatedAt))
-                    .col(timestamp_with_default(Activity::UpdatedAt))
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_activity_company")
-                            .from(Activity::Table, Activity::CompanyId)
-                            .to(Company::Table, Company::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_activity_contact")
-                            .from(Activity::Table, Activity::ContactId)
-                            .to(Contact::Table, Contact::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_activity_deal")
-                            .from(Activity::Table, Activity::DealId)
-                            .to(Deal::Table, Deal::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .check(target_check("activity"))
+                    .col(&mut timestamp_with_default(Activity::CreatedAt))
+                    .col(ColumnDef::new(Activity::CreatedBy).string_len(128))
                     .to_owned(),
             )
             .await?;
 
-        create_index(manager, "idx_activity_kind", Activity::Table, &[Activity::Kind]).await?;
-        create_index(manager, "idx_activity_at", Activity::Table, &[Activity::At]).await?;
-        create_index(manager, "idx_activity_company", Activity::Table, &[Activity::CompanyId]).await?;
-        create_index(manager, "idx_activity_contact", Activity::Table, &[Activity::ContactId]).await?;
-        create_index(manager, "idx_activity_deal", Activity::Table, &[Activity::DealId]).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_activity_kind")
+                    .table(Activity::Table)
+                    .col(Activity::Kind)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_activity_entity")
+                    .table(Activity::Table)
+                    .col(Activity::EntityType)
+                    .col(Activity::EntityId)
+                    .col(Activity::CreatedAt)
+                    .to_owned(),
+            )
+            .await?;
 
         manager
             .create_table(
                 Table::create()
                     .table(Task::Table)
                     .if_not_exists()
-                    .col(uuid_pk(Task::Id))
+                    .col(&mut uuid_pk(Task::Id))
                     .col(ColumnDef::new(Task::Title).string_len(512).not_null())
                     .col(ColumnDef::new(Task::Notes).text())
                     .col(
@@ -147,8 +141,8 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Task::CompanyId).uuid())
                     .col(ColumnDef::new(Task::ContactId).uuid())
                     .col(ColumnDef::new(Task::DealId).uuid())
-                    .col(timestamp_with_default(Task::CreatedAt))
-                    .col(timestamp_with_default(Task::UpdatedAt))
+                    .col(&mut timestamp_with_default(Task::CreatedAt))
+                    .col(&mut timestamp_with_default(Task::UpdatedAt))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_task_company")
@@ -175,24 +169,81 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        create_index(manager, "idx_task_status", Task::Table, &[Task::Status]).await?;
-        create_index(manager, "idx_task_priority", Task::Table, &[Task::Priority]).await?;
-        create_index(manager, "idx_task_due_at", Task::Table, &[Task::DueAt]).await?;
-        create_index(manager, "idx_task_company", Task::Table, &[Task::CompanyId]).await?;
-        create_index(manager, "idx_task_contact", Task::Table, &[Task::ContactId]).await?;
-        create_index(manager, "idx_task_deal", Task::Table, &[Task::DealId]).await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_status")
+                    .table(Task::Table)
+                    .col(Task::Status)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_priority")
+                    .table(Task::Table)
+                    .col(Task::Priority)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_due_at")
+                    .table(Task::Table)
+                    .col(Task::DueAt)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_company")
+                    .table(Task::Table)
+                    .col(Task::CompanyId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_contact")
+                    .table(Task::Table)
+                    .col(Task::ContactId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_task_deal")
+                    .table(Task::Table)
+                    .col(Task::DealId)
+                    .to_owned(),
+            )
+            .await?;
 
         manager
             .create_table(
                 Table::create()
                     .table(DealStageHistory::Table)
                     .if_not_exists()
-                    .col(uuid_pk(DealStageHistory::Id))
+                    .col(&mut uuid_pk(DealStageHistory::Id))
                     .col(ColumnDef::new(DealStageHistory::DealId).uuid().not_null())
-                    .col(ColumnDef::new(DealStageHistory::FromStage).string_len(32))
-                    .col(ColumnDef::new(DealStageHistory::ToStage).string_len(32).not_null())
-                    .col(timestamp_with_default(DealStageHistory::ChangedAt))
+                    .col(
+                        ColumnDef::new(DealStageHistory::FromStage)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(DealStageHistory::ToStage)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(&mut timestamp_with_default(DealStageHistory::ChangedAt))
                     .col(ColumnDef::new(DealStageHistory::Note).text())
+                    .col(ColumnDef::new(DealStageHistory::ChangedBy).string_len(128))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_deal_stage_history_deal")
@@ -204,13 +255,16 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        create_index(
-            manager,
-            "idx_deal_stage_history_deal",
-            DealStageHistory::Table,
-            &[DealStageHistory::DealId, DealStageHistory::ChangedAt],
-        )
-        .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_deal_stage_history_deal")
+                    .table(DealStageHistory::Table)
+                    .col(DealStageHistory::DealId)
+                    .col(DealStageHistory::ChangedAt)
+                    .to_owned(),
+            )
+            .await?;
 
         Ok(())
     }
@@ -229,19 +283,23 @@ impl MigrationTrait for Migration {
     }
 }
 
-fn uuid_pk<C: Iden>(col: C) -> ColumnDef {
-    ColumnDef::new(col)
+fn uuid_pk<C: Iden + 'static>(col: C) -> ColumnDef {
+    let mut column = ColumnDef::new(col);
+    column
         .uuid()
         .not_null()
         .primary_key()
-        .default(Expr::cust("gen_random_uuid()"))
+        .default(Expr::cust("gen_random_uuid()"));
+    column
 }
 
-fn timestamp_with_default<C: Iden>(col: C) -> ColumnDef {
-    ColumnDef::new(col)
+fn timestamp_with_default<C: Iden + 'static>(col: C) -> ColumnDef {
+    let mut column = ColumnDef::new(col);
+    column
         .timestamp_with_time_zone()
         .not_null()
-        .default(Expr::cust("now()"))
+        .default(Expr::cust("now()"));
+    column
 }
 
 fn target_check(table: &str) -> SimpleExpr {
@@ -251,17 +309,4 @@ fn target_check(table: &str) -> SimpleExpr {
          (CASE WHEN {tbl}.deal_id IS NOT NULL THEN 1 ELSE 0 END)) = 1)",
         tbl = table
     ))
-}
-
-async fn create_index(
-    manager: &SchemaManager,
-    name: &str,
-    table: impl Iden + Copy,
-    cols: &[impl Iden + Copy],
-) -> Result<(), DbErr> {
-    let mut stmt = Index::create().name(name).table(table);
-    for col in cols {
-        stmt = stmt.col(*col);
-    }
-    manager.create_index(stmt.to_owned()).await
 }
