@@ -16,18 +16,28 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter)]
 pub enum Relation {
     Contact,
+    Deal,
 }
 
 impl RelationTrait for Relation {
     fn def(&self) -> RelationDef {
         match self {
             Self::Contact => Entity::has_many(super::contact::Entity).into(),
+            Self::Deal => Entity::has_many(super::deal::Entity).into(),
         }
     }
 }
 
 impl Related<super::contact::Entity> for Entity {
-    fn to() -> RelationDef { Relation::Contact.def() }
+    fn to() -> RelationDef {
+        Relation::Contact.def()
+    }
+}
+
+impl Related<super::deal::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Deal.def()
+    }
 }
 
 impl ActiveModelBehavior for ActiveModel {}

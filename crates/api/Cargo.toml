@@ -4,11 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-async-graphql = { version = "7", features = ["chrono", "uuid"] }
+async-graphql = { version = "7", features = ["chrono", "uuid", "dataloader"] }
 async-graphql-axum = "7"
 axum = { version = "0.8", features = ["macros"] }
-sea-orm = { version = "0.12", features = ["runtime-tokio-rustls", "with-uuid", "with-chrono"] }
+sea-orm = { version = "0.12", features = ["runtime-tokio-rustls", "with-uuid", "with-chrono", "mock"] }
 entity = { path = "../entity" }
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[dev-dependencies]
+serde_json = "1"

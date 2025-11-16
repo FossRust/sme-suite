@@ -33,7 +33,9 @@ impl RelationTrait for Relation {
 }
 
 impl Related<super::company::Entity> for Entity {
-    fn to() -> RelationDef { Relation::Company.def() }
+    fn to() -> RelationDef {
+        Relation::Company.def()
+    }
 }
 
 impl ActiveModelBehavior for ActiveModel {}
