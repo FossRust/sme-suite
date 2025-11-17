@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_graphql::{
     Context, EmptySubscription, Enum, Error, ErrorExtensions, InputObject, Json, Object, Schema,
@@ -9,8 +9,9 @@ use entity::{activity, company, contact, deal, deal_stage_history, task};
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, Func, SimpleExpr};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, DbErr,
-    EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect, Select, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend,
+    DatabaseConnection, DbErr, EntityTrait, FromQueryResult, Order, QueryFilter, QueryOrder,
+    QuerySelect, Select, Statement, TransactionTrait, Value,
 };
 use serde_json::json;
 use tracing::info_span;
@@ -29,6 +30,29 @@ pub struct QueryRoot;
 pub struct MutationRoot;
 
 const MAX_TASKS_PAGE: i32 = 100;
+const MAX_SEARCH_PAGE: i32 = 50;
+
+#[derive(Enum, Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CrmSearchKind {
+    #[graphql(name = "COMPANY")]
+    Company,
+    #[graphql(name = "CONTACT")]
+    Contact,
+    #[graphql(name = "DEAL")]
+    Deal,
+}
+
+impl CrmSearchKind {}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct SearchHit {
+    pub kind: CrmSearchKind,
+    pub id: ID,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub score: f64,
+    pub href: Option<String>,
+}
 
 #[Object]
 impl QueryRoot {
@@ -52,6 +76,110 @@ pub struct CrmMutation;
 
 #[Object]
 impl CrmQuery {
+    async fn search(
+        &self,
+        ctx: &Context<'_>,
+        q: String,
+        kinds: Option<Vec<CrmSearchKind>>,
+        first: Option<i32>,
+        offset: Option<i32>,
+    ) -> async_graphql::Result<Vec<SearchHit>> {
+        let db = database(ctx)?;
+        let trimmed = validate_search_query(&q)?;
+        let requested = first.unwrap_or(20);
+        let limit = enforce_search_limit(requested, MAX_SEARCH_PAGE)?;
+        let skip = offset.unwrap_or(0).max(0) as u64;
+        let selected_kinds = kinds.unwrap_or_else(default_search_kinds);
+        search_hits(db.as_ref(), trimmed, &selected_kinds, limit, skip).await
+    }
+
+    async fn suggest_companies(
+        &self,
+        ctx: &Context<'_>,
+        q: String,
+        first: Option<i32>,
+    ) -> async_graphql::Result<Vec<CompanyNode>> {
+        let db = database(ctx)?;
+        let trimmed = validate_search_query(&q)?;
+        let requested = first.unwrap_or(10);
+        let limit = enforce_search_limit(requested, MAX_SEARCH_PAGE)?;
+        let hits = search_hits(db.as_ref(), trimmed, &[CrmSearchKind::Company], limit, 0).await?;
+        let ids: Vec<Uuid> = hits
+            .iter()
+            .filter_map(|hit| Uuid::parse_str(hit.id.as_str()).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let records = company::Entity::find()
+            .filter(company::Column::Id.is_in(ids.clone()))
+            .all(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        Ok(order_by_ids(ids, records, |model| model.id)
+            .into_iter()
+            .map(CompanyNode::from)
+            .collect())
+    }
+
+    async fn suggest_contacts(
+        &self,
+        ctx: &Context<'_>,
+        q: String,
+        first: Option<i32>,
+    ) -> async_graphql::Result<Vec<ContactNode>> {
+        let db = database(ctx)?;
+        let trimmed = validate_search_query(&q)?;
+        let requested = first.unwrap_or(10);
+        let limit = enforce_search_limit(requested, MAX_SEARCH_PAGE)?;
+        let hits = search_hits(db.as_ref(), trimmed, &[CrmSearchKind::Contact], limit, 0).await?;
+        let ids: Vec<Uuid> = hits
+            .iter()
+            .filter_map(|hit| Uuid::parse_str(hit.id.as_str()).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let records = contact::Entity::find()
+            .filter(contact::Column::Id.is_in(ids.clone()))
+            .all(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        Ok(order_by_ids(ids, records, |model| model.id)
+            .into_iter()
+            .map(ContactNode::from)
+            .collect())
+    }
+
+    async fn suggest_deals(
+        &self,
+        ctx: &Context<'_>,
+        q: String,
+        first: Option<i32>,
+    ) -> async_graphql::Result<Vec<DealNode>> {
+        let db = database(ctx)?;
+        let trimmed = validate_search_query(&q)?;
+        let requested = first.unwrap_or(10);
+        let limit = enforce_search_limit(requested, MAX_SEARCH_PAGE)?;
+        let hits = search_hits(db.as_ref(), trimmed, &[CrmSearchKind::Deal], limit, 0).await?;
+        let ids: Vec<Uuid> = hits
+            .iter()
+            .filter_map(|hit| Uuid::parse_str(hit.id.as_str()).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let records = deal::Entity::find()
+            .filter(deal::Column::Id.is_in(ids.clone()))
+            .all(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        Ok(order_by_ids(ids, records, |model| model.id)
+            .into_iter()
+            .map(DealNode::from)
+            .collect())
+    }
+
     #[graphql(name = "dealStageHistory")]
     async fn deal_stage_history(
         &self,
@@ -542,6 +670,65 @@ pub struct UpdateTaskInput {
 }
 
 #[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "Company")]
+pub struct CompanyNode {
+    pub id: ID,
+    pub name: String,
+    pub website: Option<String>,
+    pub phone: Option<String>,
+    #[graphql(name = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[graphql(name = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<company::Model> for CompanyNode {
+    fn from(model: company::Model) -> Self {
+        Self {
+            id: ID::from(model.id.to_string()),
+            name: model.name,
+            website: model.website,
+            phone: model.phone,
+            created_at: model.created_at.into(),
+            updated_at: model.updated_at.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "Contact")]
+pub struct ContactNode {
+    pub id: ID,
+    pub email: String,
+    #[graphql(name = "firstName")]
+    pub first_name: Option<String>,
+    #[graphql(name = "lastName")]
+    pub last_name: Option<String>,
+    pub phone: Option<String>,
+    #[graphql(name = "companyId")]
+    pub company_id: Option<ID>,
+    #[graphql(name = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[graphql(name = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<contact::Model> for ContactNode {
+    fn from(model: contact::Model) -> Self {
+        Self {
+            id: ID::from(model.id.to_string()),
+            email: model.email,
+            first_name: model.first_name,
+            last_name: model.last_name,
+            phone: model.phone,
+            company_id: model.company_id.map(|id| ID::from(id.to_string())),
+            created_at: model.created_at.into(),
+            updated_at: model.updated_at.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, SimpleObject)]
 #[graphql(name = "Task")]
 pub struct TaskNode {
     pub id: ID,
@@ -819,6 +1006,178 @@ fn error_with_code(code: &'static str, message: impl Into<String>) -> Error {
     Error::new(message).extend_with(|_, e| e.set("code", code))
 }
 
+#[derive(Debug, Clone)]
+pub struct SeededCrmRecords {
+    pub companies: Vec<company::Model>,
+    pub contacts: Vec<contact::Model>,
+    pub deals: Vec<deal::Model>,
+}
+
+impl SeededCrmRecords {
+    pub fn company_named(&self, name: &str) -> Option<&company::Model> {
+        self.companies.iter().find(|c| c.name == name)
+    }
+
+    pub fn contact_email(&self, email: &str) -> Option<&contact::Model> {
+        self.contacts.iter().find(|c| c.email == email)
+    }
+
+    pub fn deal_titled(&self, title: &str) -> Option<&deal::Model> {
+        self.deals.iter().find(|d| d.title == title)
+    }
+}
+
+pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, DbErr> {
+    let now: DateTimeWithTimeZone = Utc::now().into();
+    let acme = company::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set("ACME, Inc.".into()),
+        website: Set(Some("https://acme.test".into())),
+        phone: Set(Some("+1-555-0100".into())),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    let fossrust = company::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set("FossRust Labs".into()),
+        website: Set(Some("https://fossrust.test".into())),
+        phone: Set(Some("+1-555-0300".into())),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    let nuflights = company::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set("NuFlights LLC".into()),
+        website: Set(Some("https://nuflights.test".into())),
+        phone: Set(Some("+1-555-0200".into())),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    let ada = contact::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        email: Set("ada@acme.test".into()),
+        first_name: Set(Some("Ada".into())),
+        last_name: Set(Some("Lovelace".into())),
+        phone: Set(Some("+1-555-0110".into())),
+        company_id: Set(Some(acme.id)),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    let charles = contact::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        email: Set("charles@acme.test".into()),
+        first_name: Set(Some("Charles".into())),
+        last_name: Set(Some("Babbage".into())),
+        phone: Set(Some("+1-555-0111".into())),
+        company_id: Set(Some(acme.id)),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    let linus = contact::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        email: Set("linus@fossrust.test".into()),
+        first_name: Set(Some("Linus".into())),
+        last_name: Set(Some("Torvalds".into())),
+        phone: Set(Some("+1-555-0310".into())),
+        company_id: Set(Some(fossrust.id)),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    let grace = contact::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        email: Set("grace@nuflights.test".into()),
+        first_name: Set(Some("Grace".into())),
+        last_name: Set(Some("Hopper".into())),
+        phone: Set(Some("+1-555-0210".into())),
+        company_id: Set(Some(nuflights.id)),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    let acme_pilot = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("ACME Pilot".into()),
+        amount_cents: Set(Some(120_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::New),
+        close_date: Set(None),
+        company_id: Set(acme.id),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    let tooling = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("Rust Tooling Upgrade".into()),
+        amount_cents: Set(Some(75_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::Proposal),
+        close_date: Set(None),
+        company_id: Set(fossrust.id),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    let renewal = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("NuFlights Annual".into()),
+        amount_cents: Set(Some(210_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::Qualify),
+        close_date: Set(None),
+        company_id: Set(nuflights.id),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+
+    if let Err(err) = move_deal_stage_service(
+        db,
+        acme_pilot.id,
+        deal::Stage::Qualify,
+        Some("Qualified via discovery".into()),
+        Some("seed".into()),
+    )
+    .await
+    {
+        return Err(DbErr::Custom(format!(
+            "seed stage change failed: {:?}",
+            err
+        )));
+    }
+
+    Ok(SeededCrmRecords {
+        companies: vec![acme, fossrust, nuflights],
+        contacts: vec![ada, charles, linus, grace],
+        deals: vec![acme_pilot, tooling, renewal],
+    })
+}
+
 /// Exposed for seeders/tests to drive the same transactional logic.
 pub async fn move_deal_stage_service(
     db: &DatabaseConnection,
@@ -917,6 +1276,287 @@ async fn transition_task_status(
     active.updated_at = Set(Utc::now().into());
     let updated = active.update(db).await.map_err(db_error)?;
     Ok(updated)
+}
+
+fn default_search_kinds() -> Vec<CrmSearchKind> {
+    vec![
+        CrmSearchKind::Company,
+        CrmSearchKind::Contact,
+        CrmSearchKind::Deal,
+    ]
+}
+
+fn validate_search_query(q: &str) -> async_graphql::Result<&str> {
+    let trimmed = q.trim();
+    if trimmed.is_empty() {
+        return Err(error_with_code(
+            "VALIDATION",
+            "Search query cannot be empty",
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn enforce_search_limit(requested: i32, max: i32) -> async_graphql::Result<u64> {
+    if requested > max {
+        return Err(error_with_code(
+            "LIMIT_EXCEEDED",
+            format!("first cannot exceed {}", max),
+        ));
+    }
+    Ok(requested.max(0) as u64)
+}
+
+fn order_by_ids<T, K, F>(ids: Vec<K>, records: Vec<T>, key: F) -> Vec<T>
+where
+    K: Eq + std::hash::Hash + Copy,
+    T: Clone,
+    F: Fn(&T) -> K,
+{
+    let mut map = HashMap::new();
+    for record in records {
+        map.insert(key(&record), record);
+    }
+    ids.into_iter()
+        .filter_map(|id| map.get(&id).cloned())
+        .collect()
+}
+
+#[derive(Debug, FromQueryResult)]
+struct SearchHitRow {
+    kind: String,
+    id: Uuid,
+    title: String,
+    subtitle: Option<String>,
+    score: f64,
+    href: Option<String>,
+}
+
+impl TryFrom<SearchHitRow> for SearchHit {
+    type Error = Error;
+
+    fn try_from(row: SearchHitRow) -> Result<Self, Self::Error> {
+        let kind = match row.kind.as_str() {
+            "COMPANY" => CrmSearchKind::Company,
+            "CONTACT" => CrmSearchKind::Contact,
+            "DEAL" => CrmSearchKind::Deal,
+            _ => return Err(error_with_code("INTERNAL", "Unknown search kind")),
+        };
+        Ok(SearchHit {
+            kind,
+            id: ID::from(row.id.to_string()),
+            title: row.title,
+            subtitle: row.subtitle,
+            score: row.score,
+            href: row.href,
+        })
+    }
+}
+
+async fn search_hits(
+    db: &DatabaseConnection,
+    q: &str,
+    kinds: &[CrmSearchKind],
+    limit: u64,
+    offset: u64,
+) -> async_graphql::Result<Vec<SearchHit>> {
+    let allow_company = kinds.iter().any(|k| *k == CrmSearchKind::Company);
+    let allow_contact = kinds.iter().any(|k| *k == CrmSearchKind::Contact);
+    let allow_deal = kinds.iter().any(|k| *k == CrmSearchKind::Deal);
+    if !allow_company && !allow_contact && !allow_deal {
+        return Ok(vec![]);
+    }
+    let use_fts = q.len() >= 2 && has_tsquery_terms(db, q).await?;
+    if use_fts {
+        run_fts_search(
+            db,
+            q,
+            allow_company,
+            allow_contact,
+            allow_deal,
+            limit,
+            offset,
+        )
+        .await
+    } else {
+        run_trgm_search(
+            db,
+            q,
+            allow_company,
+            allow_contact,
+            allow_deal,
+            limit,
+            offset,
+        )
+        .await
+    }
+}
+
+async fn has_tsquery_terms(db: &DatabaseConnection, q: &str) -> async_graphql::Result<bool> {
+    let stmt = Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT length(websearch_to_tsquery('simple', $1)::text) > 0 AS has_terms",
+        vec![q.to_owned().into()],
+    );
+    let row = db.query_one(stmt).await.map_err(db_error)?;
+    Ok(row
+        .and_then(|r| r.try_get("", "has_terms").ok())
+        .unwrap_or(false))
+}
+
+async fn run_fts_search(
+    db: &DatabaseConnection,
+    q: &str,
+    allow_company: bool,
+    allow_contact: bool,
+    allow_deal: bool,
+    limit: u64,
+    offset: u64,
+) -> async_graphql::Result<Vec<SearchHit>> {
+    let mut selects: Vec<String> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    if allow_company {
+        selects.push(
+            "SELECT 'COMPANY' AS kind, id, name AS title, website AS subtitle,\
+             LEAST(1.0, ts_rank_cd(tsv, websearch_to_tsquery('simple', ?), ARRAY[1.0,0.4,0.2,0.1])) AS score,\
+             '/crm/company/' || id::text AS href\
+             FROM company\
+             WHERE tsv @@ websearch_to_tsquery('simple', ?)"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+    }
+    if allow_contact {
+        selects.push(
+            "SELECT 'CONTACT' AS kind, contact.id,\
+             COALESCE(NULLIF(trim(coalesce(contact.first_name, '') || ' ' || coalesce(contact.last_name, '')), ''), contact.email) AS title,\
+             companies.name AS subtitle,\
+             LEAST(1.0, ts_rank_cd(contact.tsv, websearch_to_tsquery('simple', ?), ARRAY[1.0,0.4,0.2,0.1])) AS score,\
+             '/crm/contact/' || contact.id::text AS href\
+             FROM contact\
+             LEFT JOIN company AS companies ON companies.id = contact.company_id\
+             WHERE contact.tsv @@ websearch_to_tsquery('simple', ?)"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+    }
+    if allow_deal {
+        selects.push(
+            "SELECT 'DEAL' AS kind, deal.id, deal.title AS title, companies.name AS subtitle,\
+             LEAST(1.0, ts_rank_cd(deal.tsv, websearch_to_tsquery('simple', ?), ARRAY[1.0,0.4,0.2,0.1])) AS score,\
+             '/crm/deal/' || deal.id::text AS href\
+             FROM deal\
+             LEFT JOIN company AS companies ON companies.id = deal.company_id\
+             WHERE deal.tsv @@ websearch_to_tsquery('simple', ?)"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+    }
+    if selects.is_empty() {
+        return Ok(vec![]);
+    }
+    let sql = format!(
+        "{} ORDER BY score DESC, title ASC LIMIT {} OFFSET {}",
+        selects.join(" UNION ALL "),
+        limit,
+        offset
+    );
+    let stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values);
+    let rows = SearchHitRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| SearchHit::try_from(row).ok())
+        .collect())
+}
+
+async fn run_trgm_search(
+    db: &DatabaseConnection,
+    q: &str,
+    allow_company: bool,
+    allow_contact: bool,
+    allow_deal: bool,
+    limit: u64,
+    offset: u64,
+) -> async_graphql::Result<Vec<SearchHit>> {
+    let mut selects: Vec<String> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    let pattern = format!("%{}%", q);
+    if allow_company {
+        selects.push(
+            "SELECT 'COMPANY' AS kind, id, name AS title, website AS subtitle,\
+             LEAST(1.0, GREATEST(similarity(name, ?), similarity(coalesce(website, ''), ?))) AS score,\
+             '/crm/company/' || id::text AS href\
+             FROM company\
+             WHERE name % ? OR name ILIKE ? OR website ILIKE ?"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(pattern.clone().into());
+        values.push(pattern.clone().into());
+    }
+    if allow_contact {
+        selects.push(
+            "SELECT 'CONTACT' AS kind, contact.id,\
+             COALESCE(NULLIF(trim(coalesce(contact.first_name, '') || ' ' || coalesce(contact.last_name, '')), ''), contact.email) AS title,\
+             companies.name AS subtitle,\
+             LEAST(1.0, GREATEST(similarity(contact.email, ?), similarity(coalesce(contact.first_name, ''), ?), similarity(coalesce(contact.last_name, ''), ?))) AS score,\
+             '/crm/contact/' || contact.id::text AS href\
+             FROM contact\
+             LEFT JOIN company AS companies ON companies.id = contact.company_id\
+             WHERE contact.email % ? OR contact.first_name % ? OR contact.last_name % ?\
+             OR contact.email ILIKE ? OR contact.first_name ILIKE ? OR contact.last_name ILIKE ?"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(pattern.clone().into());
+        values.push(pattern.clone().into());
+        values.push(pattern.clone().into());
+    }
+    if allow_deal {
+        selects.push(
+            "SELECT 'DEAL' AS kind, deal.id, deal.title AS title, companies.name AS subtitle,\
+             LEAST(1.0, similarity(deal.title, ?)) AS score,\
+             '/crm/deal/' || deal.id::text AS href\
+             FROM deal\
+             LEFT JOIN company AS companies ON companies.id = deal.company_id\
+             WHERE deal.title % ? OR deal.title ILIKE ?"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(pattern.clone().into());
+    }
+    if selects.is_empty() {
+        return Ok(vec![]);
+    }
+    let sql = format!(
+        "{} ORDER BY score DESC, title ASC LIMIT {} OFFSET {}",
+        selects.join(" UNION ALL "),
+        limit,
+        offset
+    );
+    let stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values);
+    let rows = SearchHitRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| SearchHit::try_from(row).ok())
+        .collect())
 }
 
 fn validate_task_title(value: &str) -> async_graphql::Result<String> {

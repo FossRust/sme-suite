@@ -166,64 +166,21 @@ async fn shutdown_signal() {
 }
 
 async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
-    use entity::{company, contact, deal, task};
+    use entity::task;
     use sea_orm::{ActiveModelTrait, Set};
-    let acme = company::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        name: Set("ACME, Inc.".into()),
-        website: Set(Some("https://acme.test".into())),
-        phone: Set(Some("+1-555-0100".into())),
-        ..Default::default()
-    }
-    .insert(db)
-    .await?;
 
-    let ada = contact::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        email: Set("ada@acme.test".into()),
-        first_name: Set(Some("Ada".into())),
-        last_name: Set(Some("Lovelace".into())),
-        phone: Set(Some("+1-555-0110".into())),
-        company_id: Set(Some(acme.id)),
-        ..Default::default()
-    }
-    .insert(db)
-    .await?;
-
-    let _ = contact::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        email: Set("charles@acme.test".into()),
-        first_name: Set(Some("Charles".into())),
-        last_name: Set(Some("Babbage".into())),
-        phone: Set(Some("+1-555-0111".into())),
-        company_id: Set(Some(acme.id)),
-        ..Default::default()
-    }
-    .insert(db)
-    .await?;
-
-    let inserted = deal::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        title: Set("ACME Pilot".into()),
-        amount_cents: Set(Some(120_000)),
-        currency: Set(Some("USD".into())),
-        stage: Set(deal::Stage::New),
-        close_date: Set(None),
-        company_id: Set(acme.id),
-        ..Default::default()
-    }
-    .insert(db)
-    .await?;
-
-    api::schema::move_deal_stage_service(
-        db,
-        inserted.id,
-        deal::Stage::Qualify,
-        Some("Qualified via discovery".into()),
-        Some("seed".into()),
-    )
-    .await
-    .map_err(|err| anyhow::anyhow!("seed stage change failed: {:?}", err))?;
+    let seeded = api::schema::seed_crm_demo(db)
+        .await
+        .map_err(|err| anyhow::anyhow!("seed data failed: {}", err))?;
+    let acme = seeded
+        .company_named("ACME, Inc.")
+        .ok_or_else(|| anyhow::anyhow!("missing seeded ACME company"))?;
+    let ada = seeded
+        .contact_email("ada@acme.test")
+        .ok_or_else(|| anyhow::anyhow!("missing seeded Ada contact"))?;
+    let acme_pilot = seeded
+        .deal_titled("ACME Pilot")
+        .ok_or_else(|| anyhow::anyhow!("missing seeded ACME Pilot deal"))?;
 
     let now = Utc::now();
     let open_due = now + Duration::days(7);
@@ -256,7 +213,7 @@ async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
         completed_at: Set(Some((now - Duration::days(1)).into())),
         company_id: Set(None),
         contact_id: Set(None),
-        deal_id: Set(Some(inserted.id)),
+        deal_id: Set(Some(acme_pilot.id)),
         ..Default::default()
     }
     .insert(db)

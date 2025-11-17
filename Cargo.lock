@@ -152,6 +152,7 @@ dependencies = [
  "axum",
  "chrono",
  "entity",
+ "migration",
  "sea-orm",
  "serde",
  "serde_json",
