@@ -12,6 +12,10 @@ pub struct Model {
     pub close_date: Option<Date>,
     #[sea_orm(indexed)]
     pub company_id: Uuid,
+    #[sea_orm(indexed)]
+    pub assigned_user_id: Option<Uuid>,
+    pub created_by: Option<Uuid>,
+    pub updated_by: Option<Uuid>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
@@ -24,11 +28,23 @@ pub enum Relation {
         to = "super::company::Column::Id"
     )]
     Company,
+    #[sea_orm(
+        belongs_to = "super::user::Entity",
+        from = "Column::AssignedUserId",
+        to = "super::user::Column::Id"
+    )]
+    AssignedUser,
 }
 
 impl Related<super::company::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Company.def()
+    }
+}
+
+impl Related<super::user::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::AssignedUser.def()
     }
 }
 

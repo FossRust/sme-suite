@@ -6,3 +6,7 @@ pub mod deal_stage_history;
 pub mod prelude;
 pub mod stage_meta;
 pub mod task;
+pub mod user;
+pub mod user_identity;
+pub mod user_role;
+pub mod user_secret;

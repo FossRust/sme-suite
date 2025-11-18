@@ -5,3 +5,7 @@ pub use super::deal::Entity as Deal;
 pub use super::deal_stage_history::Entity as DealStageHistory;
 pub use super::stage_meta::Entity as StageMeta;
 pub use super::task::Entity as Task;
+pub use super::user::Entity as User;
+pub use super::user_identity::Entity as UserIdentity;
+pub use super::user_role::Entity as UserRole;
+pub use super::user_secret::Entity as UserSecret;

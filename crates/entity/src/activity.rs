@@ -12,11 +12,27 @@ pub struct Model {
     pub body_md: Option<String>,
     pub meta_json: Json,
     pub created_at: DateTimeWithTimeZone,
-    pub created_by: Option<String>,
+    pub created_by: Option<Uuid>,
+    pub updated_by: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::user::Entity",
+        from = "Column::CreatedBy",
+        to = "super::user::Column::Id",
+        on_delete = "SetNull"
+    )]
+    CreatedByUser,
+    #[sea_orm(
+        belongs_to = "super::user::Entity",
+        from = "Column::UpdatedBy",
+        to = "super::user::Column::Id",
+        on_delete = "SetNull"
+    )]
+    UpdatedByUser,
+}
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveActiveEnum, Eq, PartialEq)]
 #[sea_orm(rs_type = "String", db_type = "String(Some(32))")]

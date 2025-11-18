@@ -1,12 +1,17 @@
-use api::schema::{build_schema, AppSchema};
+use api::{
+    auth::{decode_token, AuthConfig, CurrentUser, UserRole, SESSION_COOKIE},
+    schema::{build_schema, AppSchema},
+};
 use async_graphql::{http::GraphiQLSource, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::{routing::get, Router};
+use axum::{extract::State, http::HeaderMap, routing::get, Router};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
+use entity::{user, user_role};
 use migration::{Migrator, MigratorTrait};
-use sea_orm::{Database, DatabaseConnection};
+use sea_orm::{Database, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use tower_http::{
@@ -41,6 +46,17 @@ enum Cmd {
     PrintSchema,
 }
 
+#[derive(Clone)]
+struct AppState {
+    schema: Schema<
+        api::schema::QueryRoot,
+        api::schema::MutationRoot,
+        async_graphql::EmptySubscription,
+    >,
+    db: Arc<DatabaseConnection>,
+    auth: Arc<AuthConfig>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
@@ -57,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => "postgres://sme_suite:sme_suite@localhost:5432/sme_suite".to_string(),
     };
     let db = Arc::new(Database::connect(&db_url).await?);
+    let auth = Arc::new(load_auth_config());
 
     match cli.cmd {
         Cmd::Migrate { action } => {
@@ -73,14 +90,19 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::PrintSchema => {
-            let AppSchema(schema) = build_schema(db.clone());
+            let AppSchema(schema) = build_schema(db.clone(), auth.clone());
             println!("{}", schema.sdl());
             Ok(())
         }
         Cmd::Serve { bind } => {
             Migrator::up(db.as_ref(), None).await?;
-            let AppSchema(schema) = build_schema(db.clone());
-            let app = app_router(schema);
+            let AppSchema(schema) = build_schema(db.clone(), auth.clone());
+            let state = AppState {
+                schema,
+                db: db.clone(),
+                auth: auth.clone(),
+            };
+            let app = app_router(state);
 
             let addr: SocketAddr = bind.parse()?;
             let listener = TcpListener::bind(addr).await?;
@@ -96,13 +118,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn app_router(
-    schema: Schema<
-        api::schema::QueryRoot,
-        api::schema::MutationRoot,
-        async_graphql::EmptySubscription,
-    >,
-) -> Router {
+fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/graphiql", get(graphiql))
@@ -115,25 +131,115 @@ fn app_router(
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
-        .with_state(schema)
+        .with_state(state)
 }
 
 async fn graphql_get(
-    axum::extract::State(schema): axum::extract::State<
-        Schema<api::schema::QueryRoot, api::schema::MutationRoot, async_graphql::EmptySubscription>,
-    >,
+    State(state): State<AppState>,
+    headers: HeaderMap,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
-    schema.execute(req.into_inner()).await.into()
+    execute_graphql(state, headers, req).await
 }
 
 async fn graphql_post(
-    axum::extract::State(schema): axum::extract::State<
-        Schema<api::schema::QueryRoot, api::schema::MutationRoot, async_graphql::EmptySubscription>,
-    >,
+    State(state): State<AppState>,
+    headers: HeaderMap,
     req: GraphQLRequest,
 ) -> GraphQLResponse {
-    schema.execute(req.into_inner()).await.into()
+    execute_graphql(state, headers, req).await
+}
+
+async fn execute_graphql(
+    state: AppState,
+    headers: HeaderMap,
+    req: GraphQLRequest,
+) -> GraphQLResponse {
+    let mut request = req.into_inner();
+    if let Some(current_user) = authenticate_request(&state, &headers).await {
+        request = request.data(current_user);
+    }
+    state.schema.execute(request).await.into()
+}
+
+async fn authenticate_request(state: &AppState, headers: &HeaderMap) -> Option<CurrentUser> {
+    let token = extract_token(headers)?;
+    let claims = decode_token(&token, &state.auth).ok()?;
+    load_current_user(state.db.as_ref(), claims.sub).await
+}
+
+fn extract_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(text) = value.to_str() {
+            if let Some(rest) = text.strip_prefix("Bearer ") {
+                return Some(rest.trim().to_string());
+            }
+        }
+    }
+    if let Some(cookie) = headers.get(axum::http::header::COOKIE) {
+        if let Ok(text) = cookie.to_str() {
+            for part in text.split(';') {
+                let trimmed = part.trim();
+                if let Some(rest) = trimmed.strip_prefix(SESSION_COOKIE) {
+                    if let Some(value) = rest.strip_prefix('=') {
+                        return Some(value.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn load_current_user(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+) -> Option<CurrentUser> {
+    let user = user::Entity::find_by_id(user_id).one(db).await.ok()??;
+    if !user.is_active {
+        return None;
+    }
+    let roles = user_role::Entity::find()
+        .filter(user_role::Column::UserId.eq(user_id))
+        .all(db)
+        .await
+        .ok()?;
+    let parsed: Vec<UserRole> = roles
+        .into_iter()
+        .filter_map(|row| match row.role {
+            user_role::Role::Owner => Some(UserRole::Owner),
+            user_role::Role::Admin => Some(UserRole::Admin),
+            user_role::Role::Sales => Some(UserRole::Sales),
+            user_role::Role::Viewer => Some(UserRole::Viewer),
+        })
+        .collect();
+    Some(CurrentUser {
+        user_id,
+        roles: parsed,
+    })
+}
+
+fn load_auth_config() -> AuthConfig {
+    let secret = std::env::var("AUTH_SECRET").unwrap_or_else(|_| "dev-secret".into());
+    let local_auth_enabled = env_bool("LOCAL_AUTH_ENABLED", true);
+    let oidc_enabled = env_bool("OIDC_ENABLED", false);
+    let session_ttl_minutes = std::env::var("SESSION_TTL_MINUTES")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(15);
+    AuthConfig {
+        jwt_secret: secret,
+        local_auth_enabled,
+        oidc_enabled,
+        session_ttl_minutes,
+    }
+}
+
+fn env_bool(var: &str, default: bool) -> bool {
+    std::env::var(var)
+        .ok()
+        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(default)
 }
 
 async fn graphiql() -> (axum::http::HeaderMap, String) {
@@ -182,6 +288,13 @@ async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
         .deal_titled("ACME Pilot")
         .ok_or_else(|| anyhow::anyhow!("missing seeded ACME Pilot deal"))?;
 
+    let owner_user = seeded
+        .user_email("owner@sme.test")
+        .ok_or_else(|| anyhow::anyhow!("missing seeded owner user"))?;
+    let sales_user = seeded
+        .user_email("sales@sme.test")
+        .ok_or_else(|| anyhow::anyhow!("missing seeded sales user"))?;
+
     let now = Utc::now();
     let open_due = now + Duration::days(7);
     task::ActiveModel {
@@ -196,7 +309,11 @@ async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
         company_id: Set(Some(acme.id)),
         contact_id: Set(None),
         deal_id: Set(None),
-        ..Default::default()
+        assigned_user_id: Set(Some(sales_user.id)),
+        created_by: Set(Some(owner_user.id)),
+        updated_by: Set(Some(owner_user.id)),
+        created_at: Set(now.into()),
+        updated_at: Set(now.into()),
     }
     .insert(db)
     .await?;
@@ -214,7 +331,11 @@ async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
         company_id: Set(None),
         contact_id: Set(None),
         deal_id: Set(Some(acme_pilot.id)),
-        ..Default::default()
+        assigned_user_id: Set(Some(sales_user.id)),
+        created_by: Set(Some(owner_user.id)),
+        updated_by: Set(Some(owner_user.id)),
+        created_at: Set(now.into()),
+        updated_at: Set(now.into()),
     }
     .insert(db)
     .await?;
@@ -231,7 +352,11 @@ async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
         company_id: Set(None),
         contact_id: Set(Some(ada.id)),
         deal_id: Set(None),
-        ..Default::default()
+        assigned_user_id: Set(Some(sales_user.id)),
+        created_by: Set(Some(owner_user.id)),
+        updated_by: Set(Some(owner_user.id)),
+        created_at: Set(now.into()),
+        updated_at: Set(now.into()),
     }
     .insert(db)
     .await?;

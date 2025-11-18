@@ -12,6 +12,10 @@ pub struct Model {
     pub phone: Option<String>,
     #[sea_orm(indexed)]
     pub company_id: Option<Uuid>,
+    #[sea_orm(indexed)]
+    pub assigned_user_id: Option<Uuid>,
+    pub created_by: Option<Uuid>,
+    pub updated_by: Option<Uuid>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
@@ -19,6 +23,9 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter)]
 pub enum Relation {
     Company,
+    AssignedUser,
+    CreatedByUser,
+    UpdatedByUser,
 }
 
 impl RelationTrait for Relation {
@@ -27,6 +34,18 @@ impl RelationTrait for Relation {
             Self::Company => Entity::belongs_to(super::company::Entity)
                 .from(Column::CompanyId)
                 .to(super::company::Column::Id)
+                .into(),
+            Self::AssignedUser => Entity::belongs_to(super::user::Entity)
+                .from(Column::AssignedUserId)
+                .to(super::user::Column::Id)
+                .into(),
+            Self::CreatedByUser => Entity::belongs_to(super::user::Entity)
+                .from(Column::CreatedBy)
+                .to(super::user::Column::Id)
+                .into(),
+            Self::UpdatedByUser => Entity::belongs_to(super::user::Entity)
+                .from(Column::UpdatedBy)
+                .to(super::user::Column::Id)
                 .into(),
         }
     }

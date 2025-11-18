@@ -10,6 +10,8 @@ pub struct Model {
     pub status: Status,
     pub priority: Priority,
     pub assignee: Option<String>,
+    #[sea_orm(indexed)]
+    pub assigned_user_id: Option<Uuid>,
     pub due_at: Option<DateTimeWithTimeZone>,
     pub completed_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(indexed)]
@@ -18,6 +20,8 @@ pub struct Model {
     pub contact_id: Option<Uuid>,
     #[sea_orm(indexed)]
     pub deal_id: Option<Uuid>,
+    pub created_by: Option<Uuid>,
+    pub updated_by: Option<Uuid>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
@@ -45,6 +49,13 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     Deal,
+    #[sea_orm(
+        belongs_to = "super::user::Entity",
+        from = "Column::AssignedUserId",
+        to = "super::user::Column::Id",
+        on_delete = "SetNull"
+    )]
+    AssignedUser,
 }
 
 impl Related<super::company::Entity> for Entity {
@@ -62,6 +73,12 @@ impl Related<super::contact::Entity> for Entity {
 impl Related<super::deal::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Deal.def()
+    }
+}
+
+impl Related<super::user::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::AssignedUser.def()
     }
 }
 

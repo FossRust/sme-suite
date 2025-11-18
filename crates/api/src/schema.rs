@@ -1,14 +1,22 @@
+use crate::auth::{issue_token, AuthConfig, CurrentUser, UserRole, SESSION_COOKIE};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
+use argon2::Argon2;
 use async_graphql::{
     Context, EmptySubscription, Enum, Error, ErrorExtensions, InputObject, Json, Object, Schema,
     SimpleObject, ID,
 };
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
-use entity::{activity, company, contact, deal, deal_stage_history, stage_meta, task};
+use entity::{
+    activity, company, contact, deal, deal_stage_history, stage_meta, task, user, user_identity,
+    user_role, user_secret,
+};
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, Func, OnConflict, SimpleExpr};
 use sea_orm::{
@@ -22,9 +30,13 @@ use uuid::Uuid;
 
 pub struct AppSchema(pub Schema<QueryRoot, MutationRoot, EmptySubscription>);
 
-pub fn build_schema(db: Arc<DatabaseConnection>) -> AppSchema {
+pub fn build_schema(
+    db: Arc<DatabaseConnection>,
+    auth: Arc<AuthConfig>,
+) -> AppSchema {
     let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
         .data(db)
+        .data(auth)
         .finish();
     AppSchema(schema)
 }
@@ -79,6 +91,54 @@ pub struct CrmMutation;
 
 #[Object]
 impl CrmQuery {
+    async fn me(&self, ctx: &Context<'_>) -> async_graphql::Result<MePayload> {
+        let viewer = require_viewer(ctx)?;
+        let db = database(ctx)?;
+        let (model, roles) = load_user_with_roles(db.as_ref(), viewer.user_id).await?;
+        let node = UserNode::from_model(model, roles.clone());
+        Ok(MePayload {
+            user: node,
+            roles: roles.iter().map(|r| r.as_str().to_string()).collect(),
+        })
+    }
+
+    async fn users(
+        &self,
+        ctx: &Context<'_>,
+        first: Option<i32>,
+        offset: Option<i32>,
+        q: Option<String>,
+    ) -> async_graphql::Result<Vec<UserNode>> {
+        require_role(ctx, UserRole::Admin)?;
+        let db = database(ctx)?;
+        let limit = first.unwrap_or(50).clamp(1, 200) as u64;
+        let skip = offset.unwrap_or(0).max(0) as u64;
+        let mut query = user::Entity::find();
+        if let Some(filter) = sanitize_optional_filter(q) {
+            let pattern = format!("%{}%", filter);
+            query = query.filter(
+                Condition::any()
+                    .add(user::Column::Email.ilike(pattern.clone()))
+                    .add(user::Column::DisplayName.ilike(pattern)),
+            );
+        }
+        let records = query
+            .order_by_asc(user::Column::Email)
+            .limit(limit)
+            .offset(skip)
+            .all(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        let role_map = load_roles_for_users(db.as_ref(), &records).await?;
+        Ok(records
+            .into_iter()
+            .map(|model| {
+                let roles = role_map.get(&model.id).cloned().unwrap_or_default();
+                UserNode::from_model(model, roles)
+            })
+            .collect())
+    }
+
     async fn search(
         &self,
         ctx: &Context<'_>,
@@ -87,6 +147,7 @@ impl CrmQuery {
         first: Option<i32>,
         offset: Option<i32>,
     ) -> async_graphql::Result<Vec<SearchHit>> {
+        require_viewer(ctx)?;
         let db = database(ctx)?;
         let trimmed = validate_search_query(&q)?;
         let requested = first.unwrap_or(20);
@@ -102,6 +163,7 @@ impl CrmQuery {
         q: String,
         first: Option<i32>,
     ) -> async_graphql::Result<Vec<CompanyNode>> {
+        require_viewer(ctx)?;
         let db = database(ctx)?;
         let trimmed = validate_search_query(&q)?;
         let requested = first.unwrap_or(10);
@@ -131,6 +193,7 @@ impl CrmQuery {
         q: String,
         first: Option<i32>,
     ) -> async_graphql::Result<Vec<ContactNode>> {
+        require_viewer(ctx)?;
         let db = database(ctx)?;
         let trimmed = validate_search_query(&q)?;
         let requested = first.unwrap_or(10);
@@ -160,6 +223,7 @@ impl CrmQuery {
         q: String,
         first: Option<i32>,
     ) -> async_graphql::Result<Vec<DealNode>> {
+        require_viewer(ctx)?;
         let db = database(ctx)?;
         let trimmed = validate_search_query(&q)?;
         let requested = first.unwrap_or(10);
@@ -191,6 +255,7 @@ impl CrmQuery {
         first: Option<i32>,
         offset: Option<i32>,
     ) -> async_graphql::Result<Vec<DealStageHistoryNode>> {
+        require_viewer(ctx)?;
         let db = database(ctx)?;
         let deal_uuid = parse_uuid(&deal_id)?;
         let limit = first.unwrap_or(50).clamp(1, 200) as u64;
@@ -216,6 +281,7 @@ impl CrmQuery {
         first: Option<i32>,
         offset: Option<i32>,
     ) -> async_graphql::Result<Vec<ActivityNode>> {
+        require_viewer(ctx)?;
         let db = database(ctx)?;
         let deal_uuid = parse_uuid(&deal_id)?;
         let limit = first.unwrap_or(50).clamp(1, 200) as u64;
@@ -243,6 +309,7 @@ impl CrmQuery {
         filter: Option<TaskFilter>,
         #[graphql(name = "orderBy", default)] order_by: TaskOrder,
     ) -> async_graphql::Result<Vec<TaskNode>> {
+        require_viewer(ctx)?;
         let db = database(ctx)?;
         let requested = first.unwrap_or(25);
         let limit = enforce_task_limit(requested)?;
@@ -325,6 +392,7 @@ impl CrmQuery {
 
     #[graphql(name = "task")]
     async fn task(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<Option<TaskNode>> {
+        require_viewer(ctx)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let record = task::Entity::find_by_id(task_id)
@@ -338,6 +406,7 @@ impl CrmQuery {
         &self,
         ctx: &Context<'_>,
     ) -> async_graphql::Result<Vec<PipelineStage>> {
+        require_viewer(ctx)?;
         let db = database(ctx)?;
         let stages = load_stage_meta(db.as_ref()).await?;
         Ok(stages.iter().map(PipelineStage::from).collect())
@@ -353,6 +422,7 @@ impl CrmQuery {
         q: Option<String>,
         #[graphql(name = "orderByUpdated")] order_by_updated: Option<bool>,
     ) -> async_graphql::Result<PipelineBoard> {
+        require_viewer(ctx)?;
         let db = database(ctx)?;
         let requested = first_per_stage.unwrap_or(25);
         if requested < 0 {
@@ -456,6 +526,7 @@ impl CrmQuery {
         group: Option<TimeGroup>,
         #[graphql(name = "includeLost")] include_lost: Option<bool>,
     ) -> async_graphql::Result<PipelineReport> {
+        require_viewer(ctx)?;
         if range.from > range.to {
             return Err(validation_error("range.from must be on or before range.to"));
         }
@@ -504,6 +575,323 @@ impl CrmQuery {
 
 #[Object]
 impl CrmMutation {
+    async fn login(
+        &self,
+        ctx: &Context<'_>,
+        email: String,
+        password: String,
+    ) -> async_graphql::Result<AuthPayload> {
+        let auth = auth_config(ctx)?;
+        if !auth.local_auth_enabled {
+            return Err(error_with_code("FORBIDDEN", "Local authentication is disabled"));
+        }
+        let db = database(ctx)?;
+        let normalized = normalize_email(&email)?;
+        let identity = user_identity::Entity::find()
+            .filter(user_identity::Column::Provider.eq("local"))
+            .filter(user_identity::Column::Subject.eq(normalized.clone()))
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        let Some(identity) = identity else {
+            return Ok(AuthPayload {
+                ok: false,
+                user: None,
+                error: Some("Invalid credentials".into()),
+            });
+        };
+        let user = user::Entity::find_by_id(identity.user_id)
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        let Some(user) = user else {
+            return Ok(AuthPayload {
+                ok: false,
+                user: None,
+                error: Some("Invalid credentials".into()),
+            });
+        };
+        if !user.is_active {
+            return Ok(AuthPayload {
+                ok: false,
+                user: None,
+                error: Some("Account disabled".into()),
+            });
+        }
+        let secret = user_secret::Entity::find_by_id(user.id)
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        let Some(secret) = secret else {
+            return Ok(AuthPayload {
+                ok: false,
+                user: None,
+                error: Some("Invalid credentials".into()),
+            });
+        };
+        let parsed_hash = PasswordHash::new(&secret.password_hash)
+            .map_err(|_| error_with_code("INTERNAL", "Invalid password hash"))?;
+        if Argon2::default()
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .is_err()
+        {
+            return Ok(AuthPayload {
+                ok: false,
+                user: None,
+                error: Some("Invalid credentials".into()),
+            });
+        }
+        let roles = load_roles(db.as_ref(), user.id).await?;
+        let token = issue_token(user.id, &roles, &auth)
+            .map_err(|_| error_with_code("INTERNAL", "Failed to issue session token"))?;
+        append_session_cookie(ctx, &token, auth.session_ttl_minutes);
+        Ok(AuthPayload {
+            ok: true,
+            user: Some(UserNode::from_model(user, roles)),
+            error: None,
+        })
+    }
+
+    async fn logout(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {
+        append_session_cookie(ctx, "", -1);
+        Ok(true)
+    }
+
+    async fn get_auth_url(
+        &self,
+        ctx: &Context<'_>,
+        provider: String,
+    ) -> async_graphql::Result<String> {
+        let auth = auth_config(ctx)?;
+        if !auth.oidc_enabled {
+            return Err(error_with_code(
+                "VALIDATION",
+                format!("OIDC provider {} is not configured", provider),
+            ));
+        }
+        Err(error_with_code(
+            "NOT_IMPLEMENTED",
+            "OIDC integrations are not yet configured",
+        ))
+    }
+
+    async fn handle_oidc_callback(
+        &self,
+        _ctx: &Context<'_>,
+        _provider: String,
+        _code: String,
+        _state: String,
+    ) -> async_graphql::Result<AuthPayload> {
+        Err(error_with_code(
+            "NOT_IMPLEMENTED",
+            "OIDC integrations are not yet configured",
+        ))
+    }
+
+    async fn create_user(
+        &self,
+        ctx: &Context<'_>,
+        input: NewUserInput,
+    ) -> async_graphql::Result<UserNode> {
+        require_role(ctx, UserRole::Admin)?;
+        let db = database(ctx)?;
+        let email = normalize_email(&input.email)?;
+        let display_name = validate_display_name(&input.display_name)?;
+        let roles = parse_roles(&input.roles)?;
+        if roles.is_empty() {
+            return Err(validation_error("roles must include at least one entry"));
+        }
+        let txn = db.begin().await.map_err(db_error)?;
+        let now: DateTimeWithTimeZone = Utc::now().into();
+        let user_id = Uuid::new_v4();
+        user::ActiveModel {
+            id: Set(user_id),
+            email: Set(email.clone()),
+            display_name: Set(display_name),
+            avatar_url: Set(None),
+            is_active: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&txn)
+        .await
+        .map_err(db_error)?;
+        user_identity::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            user_id: Set(user_id),
+            provider: Set("local".into()),
+            subject: Set(email),
+            created_at: Set(now),
+        }
+        .insert(&txn)
+        .await
+        .map_err(db_error)?;
+        insert_roles(&txn, user_id, &roles).await?;
+        txn.commit().await.map_err(db_error)?;
+        let record = user::Entity::find_by_id(user_id)
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| error_with_code("INTERNAL", "Failed to load new user"))?;
+        Ok(UserNode::from_model(record, roles))
+    }
+
+    async fn update_user(
+        &self,
+        ctx: &Context<'_>,
+        input: UpdateUserInput,
+    ) -> async_graphql::Result<UserNode> {
+        require_role(ctx, UserRole::Admin)?;
+        let db = database(ctx)?;
+        let user_id = parse_uuid(&input.id)?;
+        let mut model = user::Entity::find_by_id(user_id)
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| error_with_code("NOT_FOUND", "User not found"))?;
+        if let Some(display_name) = &input.display_name {
+            model.display_name = validate_display_name(display_name)?;
+        }
+        if let Some(is_active) = input.is_active {
+            model.is_active = is_active;
+        }
+        model.updated_at = Utc::now().into();
+        let mut active: user::ActiveModel = model.clone().into();
+        if let Some(display_name) = &input.display_name {
+            active.display_name = Set(display_name.trim().to_string());
+        }
+        if let Some(is_active) = input.is_active {
+            active.is_active = Set(is_active);
+        }
+        active.updated_at = Set(Utc::now().into());
+        let updated = active.update(db.as_ref()).await.map_err(db_error)?;
+        let mut roles = load_roles(db.as_ref(), user_id).await?;
+        if let Some(role_values) = input.roles {
+            let parsed = parse_roles(&role_values)?;
+            let txn = db.begin().await.map_err(db_error)?;
+            user_role::Entity::delete_many()
+                .filter(user_role::Column::UserId.eq(user_id))
+                .exec(&txn)
+                .await
+                .map_err(db_error)?;
+            insert_roles(&txn, user_id, &parsed).await?;
+            txn.commit().await.map_err(db_error)?;
+            roles = parsed;
+        }
+        Ok(UserNode::from_model(updated, roles))
+    }
+
+    #[graphql(name = "assignCompany")]
+    async fn assign_company(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+        #[graphql(name = "userId")] user_id: Option<ID>,
+    ) -> async_graphql::Result<CompanyNode> {
+        let current = require_role(ctx, UserRole::Sales)?;
+        let db = database(ctx)?;
+        let company_id = parse_uuid(&id)?;
+        let target_user = match user_id {
+            Some(uid) => Some(ensure_active_user(db.as_ref(), parse_uuid(&uid)?).await?),
+            None => None,
+        };
+        let now: DateTimeWithTimeZone = Utc::now().into();
+        let company = company::Entity::find_by_id(company_id)
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| error_with_code("NOT_FOUND", "Company not found"))?;
+        let mut active: company::ActiveModel = company.into();
+        active.assigned_user_id = Set(target_user);
+        active.updated_by = Set(Some(current.user_id));
+        active.updated_at = Set(now);
+        let updated = active.update(db.as_ref()).await.map_err(db_error)?;
+        Ok(updated.into())
+    }
+
+    #[graphql(name = "assignContact")]
+    async fn assign_contact(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+        #[graphql(name = "userId")] user_id: Option<ID>,
+    ) -> async_graphql::Result<ContactNode> {
+        let current = require_role(ctx, UserRole::Sales)?;
+        let db = database(ctx)?;
+        let contact_id = parse_uuid(&id)?;
+        let target_user = match user_id {
+            Some(uid) => Some(ensure_active_user(db.as_ref(), parse_uuid(&uid)?).await?),
+            None => None,
+        };
+        let now: DateTimeWithTimeZone = Utc::now().into();
+        let contact = contact::Entity::find_by_id(contact_id)
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| error_with_code("NOT_FOUND", "Contact not found"))?;
+        let mut active: contact::ActiveModel = contact.into();
+        active.assigned_user_id = Set(target_user);
+        active.updated_by = Set(Some(current.user_id));
+        active.updated_at = Set(now);
+        let updated = active.update(db.as_ref()).await.map_err(db_error)?;
+        Ok(updated.into())
+    }
+
+    #[graphql(name = "assignDeal")]
+    async fn assign_deal(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+        #[graphql(name = "userId")] user_id: Option<ID>,
+    ) -> async_graphql::Result<DealNode> {
+        let current = require_role(ctx, UserRole::Sales)?;
+        let db = database(ctx)?;
+        let deal_id = parse_uuid(&id)?;
+        let target_user = match user_id {
+            Some(uid) => Some(ensure_active_user(db.as_ref(), parse_uuid(&uid)?).await?),
+            None => None,
+        };
+        let now: DateTimeWithTimeZone = Utc::now().into();
+        let deal = deal::Entity::find_by_id(deal_id)
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| error_with_code("NOT_FOUND", "Deal not found"))?;
+        let mut active: deal::ActiveModel = deal.into();
+        active.assigned_user_id = Set(target_user);
+        active.updated_by = Set(Some(current.user_id));
+        active.updated_at = Set(now);
+        let updated = active.update(db.as_ref()).await.map_err(db_error)?;
+        Ok(updated.into())
+    }
+
+    #[graphql(name = "assignTask")]
+    async fn assign_task(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+        #[graphql(name = "userId")] user_id: Option<ID>,
+    ) -> async_graphql::Result<TaskNode> {
+        let current = require_role(ctx, UserRole::Sales)?;
+        let db = database(ctx)?;
+        let task_id = parse_uuid(&id)?;
+        let target_user = match user_id {
+            Some(uid) => Some(ensure_active_user(db.as_ref(), parse_uuid(&uid)?).await?),
+            None => None,
+        };
+        let now: DateTimeWithTimeZone = Utc::now().into();
+        let task = task::Entity::find_by_id(task_id)
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| error_with_code("NOT_FOUND", "Task not found"))?;
+        let mut active: task::ActiveModel = task.into();
+        active.assigned_user_id = Set(target_user);
+        active.updated_by = Set(Some(current.user_id));
+        active.updated_at = Set(now);
+        let updated = active.update(db.as_ref()).await.map_err(db_error)?;
+        Ok(TaskNode::from(updated))
+    }
     #[graphql(name = "moveDealStage")]
     async fn move_deal_stage(
         &self,
@@ -512,11 +900,13 @@ impl CrmMutation {
         stage: DealStage,
         note: Option<String>,
     ) -> async_graphql::Result<DealNode> {
+        let current = require_role(ctx, UserRole::Sales)?;
         let db = database(ctx)?;
         let deal_id = parse_uuid(&id)?;
         let target_stage: deal::Stage = stage.into();
 
-        let model = move_deal_stage_internal(db.as_ref(), deal_id, target_stage, note, None)
+        let model =
+            move_deal_stage_internal(db.as_ref(), deal_id, target_stage, note, Some(current.user_id))
             .await
             .map_err(stage_move_error)?;
 
@@ -529,6 +919,7 @@ impl CrmMutation {
         ctx: &Context<'_>,
         input: NewTaskInput,
     ) -> async_graphql::Result<TaskNode> {
+        let current = require_role(ctx, UserRole::Sales)?;
         let db = database(ctx)?;
         let span = info_span!(
             "crm.tasks.create",
@@ -539,7 +930,7 @@ impl CrmMutation {
             first = 0
         );
         let _guard = span.enter();
-        let task = create_task_internal(db.as_ref(), input).await?;
+        let task = create_task_internal(db.as_ref(), input, &current).await?;
         Ok(task.into())
     }
 
@@ -549,13 +940,15 @@ impl CrmMutation {
         ctx: &Context<'_>,
         input: UpdateTaskInput,
     ) -> async_graphql::Result<TaskNode> {
+        let current = require_role(ctx, UserRole::Sales)?;
         let db = database(ctx)?;
-        let task = update_task_internal(db.as_ref(), input).await?;
+        let task = update_task_internal(db.as_ref(), input, &current).await?;
         Ok(task.into())
     }
 
     #[graphql(name = "completeTask")]
     async fn complete_task(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<TaskNode> {
+        let current = require_role(ctx, UserRole::Sales)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let existing = task::Entity::find_by_id(task_id)
@@ -579,6 +972,7 @@ impl CrmMutation {
             existing,
             task::Status::Done,
             Some(Utc::now().into()),
+            &current,
         )
         .await?;
         Ok(task.into())
@@ -586,6 +980,7 @@ impl CrmMutation {
 
     #[graphql(name = "cancelTask")]
     async fn cancel_task(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<TaskNode> {
+        let current = require_role(ctx, UserRole::Sales)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let existing = task::Entity::find_by_id(task_id)
@@ -604,13 +999,20 @@ impl CrmMutation {
             first = 0
         );
         let _guard = span.enter();
-        let task =
-            transition_task_status(db.as_ref(), existing, task::Status::Cancelled, None).await?;
+        let task = transition_task_status(
+            db.as_ref(),
+            existing,
+            task::Status::Cancelled,
+            None,
+            &current,
+        )
+        .await?;
         Ok(task.into())
     }
 
     #[graphql(name = "reopenTask")]
     async fn reopen_task(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<TaskNode> {
+        let current = require_role(ctx, UserRole::Sales)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let existing = task::Entity::find_by_id(task_id)
@@ -629,12 +1031,20 @@ impl CrmMutation {
             first = 0
         );
         let _guard = span.enter();
-        let task = transition_task_status(db.as_ref(), existing, task::Status::Open, None).await?;
+        let task = transition_task_status(
+            db.as_ref(),
+            existing,
+            task::Status::Open,
+            None,
+            &current,
+        )
+        .await?;
         Ok(task.into())
     }
 
     #[graphql(name = "deleteTask")]
     async fn delete_task(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<bool> {
+        require_role(ctx, UserRole::Sales)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let res = task::Entity::delete_by_id(task_id)
@@ -846,6 +1256,12 @@ pub struct CompanyNode {
     pub name: String,
     pub website: Option<String>,
     pub phone: Option<String>,
+    #[graphql(name = "assignedUserId")]
+    pub assigned_user_id: Option<ID>,
+    #[graphql(name = "createdBy")]
+    pub created_by: Option<ID>,
+    #[graphql(name = "updatedBy")]
+    pub updated_by: Option<ID>,
     #[graphql(name = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[graphql(name = "updatedAt")]
@@ -859,6 +1275,9 @@ impl From<company::Model> for CompanyNode {
             name: model.name,
             website: model.website,
             phone: model.phone,
+            assigned_user_id: model.assigned_user_id.map(|id| ID::from(id.to_string())),
+            created_by: model.created_by.map(|id| ID::from(id.to_string())),
+            updated_by: model.updated_by.map(|id| ID::from(id.to_string())),
             created_at: model.created_at.into(),
             updated_at: model.updated_at.into(),
         }
@@ -877,6 +1296,12 @@ pub struct ContactNode {
     pub phone: Option<String>,
     #[graphql(name = "companyId")]
     pub company_id: Option<ID>,
+    #[graphql(name = "assignedUserId")]
+    pub assigned_user_id: Option<ID>,
+    #[graphql(name = "createdBy")]
+    pub created_by: Option<ID>,
+    #[graphql(name = "updatedBy")]
+    pub updated_by: Option<ID>,
     #[graphql(name = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[graphql(name = "updatedAt")]
@@ -892,6 +1317,9 @@ impl From<contact::Model> for ContactNode {
             last_name: model.last_name,
             phone: model.phone,
             company_id: model.company_id.map(|id| ID::from(id.to_string())),
+            assigned_user_id: model.assigned_user_id.map(|id| ID::from(id.to_string())),
+            created_by: model.created_by.map(|id| ID::from(id.to_string())),
+            updated_by: model.updated_by.map(|id| ID::from(id.to_string())),
             created_at: model.created_at.into(),
             updated_at: model.updated_at.into(),
         }
@@ -908,6 +1336,8 @@ pub struct TaskNode {
     pub status: TaskStatus,
     pub priority: TaskPriority,
     pub assignee: Option<String>,
+    #[graphql(name = "assignedUserId")]
+    pub assigned_user_id: Option<ID>,
     #[graphql(name = "dueAt")]
     pub due_at: Option<DateTime<Utc>>,
     #[graphql(name = "completedAt")]
@@ -918,6 +1348,10 @@ pub struct TaskNode {
     pub contact_id: Option<ID>,
     #[graphql(name = "dealId")]
     pub deal_id: Option<ID>,
+    #[graphql(name = "createdBy")]
+    pub created_by: Option<ID>,
+    #[graphql(name = "updatedBy")]
+    pub updated_by: Option<ID>,
     #[graphql(name = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[graphql(name = "updatedAt")]
@@ -933,11 +1367,14 @@ impl From<task::Model> for TaskNode {
             status: model.status.into(),
             priority: model.priority.into(),
             assignee: model.assignee,
+            assigned_user_id: model.assigned_user_id.map(|id| ID::from(id.to_string())),
             due_at: model.due_at.map(|d| d.into()),
             completed_at: model.completed_at.map(|d| d.into()),
             company_id: model.company_id.map(|id| ID::from(id.to_string())),
             contact_id: model.contact_id.map(|id| ID::from(id.to_string())),
             deal_id: model.deal_id.map(|id| ID::from(id.to_string())),
+            created_by: model.created_by.map(|id| ID::from(id.to_string())),
+            updated_by: model.updated_by.map(|id| ID::from(id.to_string())),
             created_at: model.created_at.into(),
             updated_at: model.updated_at.into(),
         }
@@ -957,6 +1394,12 @@ pub struct DealNode {
     pub close_date: Option<NaiveDate>,
     #[graphql(name = "companyId")]
     pub company_id: ID,
+    #[graphql(name = "assignedUserId")]
+    pub assigned_user_id: Option<ID>,
+    #[graphql(name = "createdBy")]
+    pub created_by: Option<ID>,
+    #[graphql(name = "updatedBy")]
+    pub updated_by: Option<ID>,
     #[graphql(name = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[graphql(name = "updatedAt")]
@@ -973,6 +1416,9 @@ impl From<deal::Model> for DealNode {
             stage: model.stage.into(),
             close_date: model.close_date,
             company_id: ID::from(model.company_id.to_string()),
+            assigned_user_id: model.assigned_user_id.map(|id| ID::from(id.to_string())),
+            created_by: model.created_by.map(|id| ID::from(id.to_string())),
+            updated_by: model.updated_by.map(|id| ID::from(id.to_string())),
             created_at: model.created_at.into(),
             updated_at: model.updated_at.into(),
         }
@@ -1028,7 +1474,7 @@ pub struct ActivityNode {
     #[graphql(name = "createdAt")]
     pub created_at: DateTime<Utc>,
     #[graphql(name = "createdBy")]
-    pub created_by: Option<String>,
+    pub created_by: Option<ID>,
 }
 
 impl From<activity::Model> for ActivityNode {
@@ -1044,9 +1490,73 @@ impl From<activity::Model> for ActivityNode {
             body_md: model.body_md,
             meta_json: Json(model.meta_json),
             created_at: model.created_at.into(),
-            created_by: model.created_by,
+            created_by: model.created_by.map(|id| ID::from(id.to_string())),
         }
     }
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "User")]
+pub struct UserNode {
+    pub id: ID,
+    pub email: String,
+    #[graphql(name = "displayName")]
+    pub display_name: String,
+    #[graphql(name = "avatarUrl")]
+    pub avatar_url: Option<String>,
+    #[graphql(name = "isActive")]
+    pub is_active: bool,
+    pub roles: Vec<String>,
+    #[graphql(name = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[graphql(name = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
+impl UserNode {
+    fn from_model(model: user::Model, roles: Vec<UserRole>) -> Self {
+        Self {
+            id: ID::from(model.id.to_string()),
+            email: model.email,
+            display_name: model.display_name,
+            avatar_url: model.avatar_url,
+            is_active: model.is_active,
+            roles: roles.into_iter().map(|r| r.as_str().to_string()).collect(),
+            created_at: model.created_at.into(),
+            updated_at: model.updated_at.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct MePayload {
+    pub user: UserNode,
+    pub roles: Vec<String>,
+}
+
+#[derive(Clone, Debug, SimpleObject, Default)]
+pub struct AuthPayload {
+    pub ok: bool,
+    pub user: Option<UserNode>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, InputObject)]
+pub struct NewUserInput {
+    pub email: String,
+    #[graphql(name = "displayName")]
+    pub display_name: String,
+    pub roles: Vec<String>,
+}
+
+#[derive(Clone, Debug, InputObject)]
+pub struct UpdateUserInput {
+    pub id: ID,
+    #[graphql(name = "displayName")]
+    pub display_name: Option<String>,
+    pub roles: Option<Vec<String>>,
+    #[graphql(name = "isActive")]
+    pub is_active: Option<bool>,
 }
 
 #[derive(Clone, Debug, SimpleObject)]
@@ -1207,7 +1717,7 @@ async fn move_deal_stage_internal(
     deal_id: Uuid,
     stage: deal::Stage,
     note: Option<String>,
-    changed_by: Option<String>,
+    changed_by: Option<Uuid>,
 ) -> Result<deal::Model, StageMoveError> {
     let txn = db.begin().await?;
     let existing = deal::Entity::find_by_id(deal_id)
@@ -1226,8 +1736,10 @@ async fn move_deal_stage_internal(
 
     let from_stage = existing.stage;
     let mut active: deal::ActiveModel = existing.into();
+    let actor = changed_by;
     active.stage = Set(stage);
     active.updated_at = Set(now.clone());
+    active.updated_by = Set(actor);
     let updated = active.update(&txn).await?;
 
     let history = deal_stage_history::ActiveModel {
@@ -1237,20 +1749,13 @@ async fn move_deal_stage_internal(
         to_stage: Set(stage),
         changed_at: Set(now.clone()),
         note: Set(note.clone()),
-        changed_by: Set(changed_by.clone()),
+        changed_by: Set(actor.map(|id| id.to_string())),
     };
     deal_stage_history::Entity::insert(history)
         .exec_without_returning(&txn)
         .await?;
 
-    let activity = activity_stage_change(
-        deal_id,
-        from_stage,
-        stage,
-        note,
-        changed_by.clone(),
-        now.clone(),
-    );
+    let activity = activity_stage_change(deal_id, from_stage, stage, note, actor, now.clone());
     activity::Entity::insert(activity)
         .exec_without_returning(&txn)
         .await?;
@@ -1264,7 +1769,7 @@ fn activity_stage_change(
     from: deal::Stage,
     to: deal::Stage,
     note: Option<String>,
-    changed_by: Option<String>,
+    changed_by: Option<Uuid>,
     timestamp: DateTimeWithTimeZone,
 ) -> activity::ActiveModel {
     let subject = format!("Stage: {} -> {}", stage_str(from), stage_str(to));
@@ -1277,7 +1782,8 @@ fn activity_stage_change(
         body_md: Set(note.clone()),
         meta_json: Set(json!({ "from": stage_str(from), "to": stage_str(to) })),
         created_at: Set(timestamp),
-        created_by: Set(changed_by.clone()),
+        created_by: Set(changed_by),
+        updated_by: Set(None),
     }
 }
 
@@ -1298,6 +1804,31 @@ fn database(ctx: &Context<'_>) -> async_graphql::Result<Arc<DatabaseConnection>>
         .map_err(|_| error_with_code("INTERNAL", "Missing database connection"))
 }
 
+fn auth_config(ctx: &Context<'_>) -> async_graphql::Result<Arc<AuthConfig>> {
+    ctx.data::<Arc<AuthConfig>>()
+        .cloned()
+        .map_err(|_| error_with_code("INTERNAL", "Missing auth configuration"))
+}
+
+fn current_user(ctx: &Context<'_>) -> async_graphql::Result<CurrentUser> {
+    ctx.data::<CurrentUser>()
+        .cloned()
+        .map_err(|_| error_with_code("UNAUTHENTICATED", "Login required"))
+}
+
+fn require_role(ctx: &Context<'_>, role: UserRole) -> async_graphql::Result<CurrentUser> {
+    let user = current_user(ctx)?;
+    if user.has_role(role) {
+        Ok(user)
+    } else {
+        Err(error_with_code("FORBIDDEN", "Insufficient permissions"))
+    }
+}
+
+fn require_viewer(ctx: &Context<'_>) -> async_graphql::Result<CurrentUser> {
+    require_role(ctx, UserRole::Viewer)
+}
+
 fn parse_uuid(id: &ID) -> async_graphql::Result<Uuid> {
     Uuid::parse_str(id.as_str()).map_err(|_| error_with_code("BAD_REQUEST", "Invalid ID"))
 }
@@ -1312,12 +1843,17 @@ fn error_with_code(code: &'static str, message: impl Into<String>) -> Error {
 
 #[derive(Debug, Clone)]
 pub struct SeededCrmRecords {
+    pub users: Vec<user::Model>,
     pub companies: Vec<company::Model>,
-    pub contacts: Vec<contact::Model>,
-    pub deals: Vec<deal::Model>,
+   pub contacts: Vec<contact::Model>,
+   pub deals: Vec<deal::Model>,
 }
 
 impl SeededCrmRecords {
+    pub fn user_email(&self, email: &str) -> Option<&user::Model> {
+        self.users.iter().find(|u| u.email == email)
+    }
+
     pub fn company_named(&self, name: &str) -> Option<&company::Model> {
         self.companies.iter().find(|c| c.name == name)
     }
@@ -1334,11 +1870,38 @@ impl SeededCrmRecords {
 pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, DbErr> {
     ensure_stage_meta_defaults(db).await?;
     let seeded_at: DateTimeWithTimeZone = Utc::now().into();
+    let owner = insert_seed_user(
+        db,
+        "owner@sme.test",
+        "Owner One",
+        &[user_role::Role::Owner, user_role::Role::Admin],
+        "ownerpass",
+    )
+    .await?;
+    let admin = insert_seed_user(
+        db,
+        "admin@sme.test",
+        "Admin Ada",
+        &[user_role::Role::Admin],
+        "adminpass",
+    )
+    .await?;
+    let sales = insert_seed_user(
+        db,
+        "sales@sme.test",
+        "Sales Sam",
+        &[user_role::Role::Sales],
+        "salespass",
+    )
+    .await?;
     let acme = company::ActiveModel {
         id: Set(Uuid::new_v4()),
         name: Set("ACME, Inc.".into()),
         website: Set(Some("https://acme.test".into())),
         phone: Set(Some("+1-555-0100".into())),
+        assigned_user_id: Set(Some(sales.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(seeded_at),
         updated_at: Set(seeded_at),
     }
@@ -1350,6 +1913,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         name: Set("FossRust Labs".into()),
         website: Set(Some("https://fossrust.test".into())),
         phone: Set(Some("+1-555-0300".into())),
+        assigned_user_id: Set(Some(admin.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(seeded_at),
         updated_at: Set(seeded_at),
     }
@@ -1361,6 +1927,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         name: Set("NuFlights LLC".into()),
         website: Set(Some("https://nuflights.test".into())),
         phone: Set(Some("+1-555-0200".into())),
+        assigned_user_id: Set(Some(sales.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(seeded_at),
         updated_at: Set(seeded_at),
     }
@@ -1374,6 +1943,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         last_name: Set(Some("Lovelace".into())),
         phone: Set(Some("+1-555-0110".into())),
         company_id: Set(Some(acme.id)),
+        assigned_user_id: Set(Some(sales.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(seeded_at),
         updated_at: Set(seeded_at),
     }
@@ -1387,6 +1959,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         last_name: Set(Some("Babbage".into())),
         phone: Set(Some("+1-555-0111".into())),
         company_id: Set(Some(acme.id)),
+        assigned_user_id: Set(Some(admin.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(seeded_at),
         updated_at: Set(seeded_at),
     }
@@ -1400,6 +1975,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         last_name: Set(Some("Torvalds".into())),
         phone: Set(Some("+1-555-0310".into())),
         company_id: Set(Some(fossrust.id)),
+        assigned_user_id: Set(Some(admin.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(seeded_at),
         updated_at: Set(seeded_at),
     }
@@ -1413,6 +1991,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         last_name: Set(Some("Hopper".into())),
         phone: Set(Some("+1-555-0210".into())),
         company_id: Set(Some(nuflights.id)),
+        assigned_user_id: Set(Some(sales.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(seeded_at),
         updated_at: Set(seeded_at),
     }
@@ -1427,6 +2008,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         stage: Set(deal::Stage::Qualify),
         close_date: Set(Some(naive_date(2025, 1, 10))),
         company_id: Set(acme.id),
+        assigned_user_id: Set(Some(sales.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(timestamp(2024, 12, 1)),
         updated_at: Set(timestamp(2024, 12, 15)),
     }
@@ -1441,6 +2025,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         stage: Set(deal::Stage::Proposal),
         close_date: Set(Some(naive_date(2025, 2, 15))),
         company_id: Set(fossrust.id),
+        assigned_user_id: Set(Some(admin.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(timestamp(2024, 12, 5)),
         updated_at: Set(timestamp(2024, 12, 20)),
     }
@@ -1455,6 +2042,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         stage: Set(deal::Stage::Qualify),
         close_date: Set(Some(naive_date(2025, 3, 5))),
         company_id: Set(nuflights.id),
+        assigned_user_id: Set(Some(sales.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(timestamp(2024, 12, 10)),
         updated_at: Set(timestamp(2025, 1, 3)),
     }
@@ -1469,6 +2059,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         stage: Set(deal::Stage::Negotiate),
         close_date: Set(Some(naive_date(2025, 2, 28))),
         company_id: Set(acme.id),
+        assigned_user_id: Set(Some(sales.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(timestamp(2024, 12, 12)),
         updated_at: Set(timestamp(2025, 1, 12)),
     }
@@ -1483,6 +2076,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         stage: Set(deal::Stage::Won),
         close_date: Set(Some(naive_date(2025, 1, 20))),
         company_id: Set(fossrust.id),
+        assigned_user_id: Set(Some(admin.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(timestamp(2024, 12, 15)),
         updated_at: Set(timestamp(2025, 1, 22)),
     }
@@ -1497,6 +2093,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         stage: Set(deal::Stage::Won),
         close_date: Set(Some(naive_date(2025, 2, 10))),
         company_id: Set(acme.id),
+        assigned_user_id: Set(Some(sales.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(timestamp(2025, 1, 5)),
         updated_at: Set(timestamp(2025, 2, 2)),
     }
@@ -1511,6 +2110,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         stage: Set(deal::Stage::Lost),
         close_date: Set(Some(naive_date(2025, 1, 25))),
         company_id: Set(nuflights.id),
+        assigned_user_id: Set(Some(sales.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(timestamp(2024, 12, 18)),
         updated_at: Set(timestamp(2025, 1, 25)),
     }
@@ -1525,6 +2127,9 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         stage: Set(deal::Stage::New),
         close_date: Set(Some(naive_date(2025, 3, 15))),
         company_id: Set(acme.id),
+        assigned_user_id: Set(Some(sales.id)),
+        created_by: Set(Some(owner.id)),
+        updated_by: Set(Some(owner.id)),
         created_at: Set(timestamp(2025, 1, 20)),
         updated_at: Set(timestamp(2025, 1, 20)),
     }
@@ -1539,7 +2144,7 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
             to_stage: Set(deal::Stage::Won),
             changed_at: Set(timestamp(2025, 1, 22)),
             note: Set(Some("Signed master services.".into())),
-            changed_by: Set(Some("seed".into())),
+            changed_by: Set(Some(owner.id.to_string())),
         },
         deal_stage_history::ActiveModel {
             id: Set(Uuid::new_v4()),
@@ -1548,7 +2153,7 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
             to_stage: Set(deal::Stage::Won),
             changed_at: Set(timestamp(2025, 2, 2)),
             note: Set(Some("Fast track approval.".into())),
-            changed_by: Set(Some("seed".into())),
+            changed_by: Set(Some(owner.id.to_string())),
         },
     ];
     for history in won_histories {
@@ -1558,6 +2163,7 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
     }
 
     Ok(SeededCrmRecords {
+        users: vec![owner.clone(), admin.clone(), sales.clone()],
         companies: vec![acme, fossrust, nuflights],
         contacts: vec![ada, charles, linus, grace],
         deals: vec![
@@ -1571,6 +2177,60 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
             fresh_prospect.clone(),
         ],
     })
+}
+
+async fn insert_seed_user(
+    db: &DatabaseConnection,
+    email: &str,
+    display_name: &str,
+    roles: &[user_role::Role],
+    password: &str,
+) -> Result<user::Model, DbErr> {
+    let now: DateTimeWithTimeZone = Utc::now().into();
+    let model = user::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        email: Set(email.to_string()),
+        display_name: Set(display_name.to_string()),
+        avatar_url: Set(None),
+        is_active: Set(true),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+    user_identity::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        user_id: Set(model.id),
+        provider: Set("local".into()),
+        subject: Set(email.to_string()),
+        created_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+    user_secret::ActiveModel {
+        user_id: Set(model.id),
+        password_hash: Set(hash_password(password)?),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+    for role in roles {
+        user_role::ActiveModel {
+            user_id: Set(model.id),
+            role: Set(*role),
+        }
+        .insert(db)
+        .await?;
+    }
+    Ok(model)
+}
+
+fn hash_password(password: &str) -> Result<String, DbErr> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|err| DbErr::Custom(format!("hash error: {}", err)))
 }
 
 const STAGE_META_DEFAULTS: [(&str, &str, i16, i16, bool, bool); 6] = [
@@ -1624,7 +2284,7 @@ pub async fn move_deal_stage_service(
     deal_id: Uuid,
     stage: deal::Stage,
     note: Option<String>,
-    changed_by: Option<String>,
+    changed_by: Option<Uuid>,
 ) -> Result<deal::Model, StageMoveError> {
     move_deal_stage_internal(db, deal_id, stage, note, changed_by).await
 }
@@ -1632,6 +2292,7 @@ pub async fn move_deal_stage_service(
 async fn create_task_internal(
     db: &DatabaseConnection,
     input: NewTaskInput,
+    current: &CurrentUser,
 ) -> async_graphql::Result<task::Model> {
     let title = validate_task_title(&input.title)?;
     let notes_md = validate_notes_md(input.notes_md.clone())?;
@@ -1649,11 +2310,14 @@ async fn create_task_internal(
         status: Set(task::Status::Open),
         priority: Set(task::Priority::from(input.priority)),
         assignee: Set(assignee),
+        assigned_user_id: Set(None),
         due_at: Set(due_at),
         completed_at: Set(None),
         company_id: Set(None),
         contact_id: Set(None),
         deal_id: Set(None),
+        created_by: Set(Some(current.user_id)),
+        updated_by: Set(Some(current.user_id)),
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -1673,6 +2337,7 @@ async fn create_task_internal(
 async fn update_task_internal(
     db: &DatabaseConnection,
     input: UpdateTaskInput,
+    current: &CurrentUser,
 ) -> async_graphql::Result<task::Model> {
     let task_id = parse_uuid(&input.id)?;
     let existing = task::Entity::find_by_id(task_id)
@@ -1696,7 +2361,9 @@ async fn update_task_internal(
     if let Some(due_at) = input.due_at {
         active.due_at = Set(Some(due_at.into()));
     }
-    active.updated_at = Set(Utc::now().into());
+    let now: DateTimeWithTimeZone = Utc::now().into();
+    active.updated_at = Set(now);
+    active.updated_by = Set(Some(current.user_id));
     let updated = active.update(db).await.map_err(db_error)?;
     Ok(updated)
 }
@@ -1706,6 +2373,7 @@ async fn transition_task_status(
     existing: task::Model,
     next_status: task::Status,
     completed_at: Option<DateTimeWithTimeZone>,
+    current: &CurrentUser,
 ) -> async_graphql::Result<task::Model> {
     if existing.status == next_status && existing.completed_at == completed_at {
         return Ok(existing);
@@ -1713,7 +2381,9 @@ async fn transition_task_status(
     let mut active: task::ActiveModel = existing.into();
     active.status = Set(next_status);
     active.completed_at = Set(completed_at);
-    active.updated_at = Set(Utc::now().into());
+    let now: DateTimeWithTimeZone = Utc::now().into();
+    active.updated_at = Set(now);
+    active.updated_by = Set(Some(current.user_id));
     let updated = active.update(db).await.map_err(db_error)?;
     Ok(updated)
 }
@@ -2360,6 +3030,147 @@ fn percentile(values: &[f64], percentile: f64) -> f64 {
     let rank = (clamped * values.len() as f64).ceil().max(1.0) as usize - 1;
     let idx = rank.min(values.len() - 1);
     values[idx]
+}
+
+fn append_session_cookie(ctx: &Context<'_>, token: &str, ttl_minutes: i64) {
+    let max_age = (ttl_minutes.max(0) * 60).to_string();
+    let cookie = if ttl_minutes < 0 {
+        format!(
+            "{}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax",
+            SESSION_COOKIE
+        )
+    } else {
+        format!(
+            "{}={}; Max-Age={}; Path=/; HttpOnly; SameSite=Lax",
+            SESSION_COOKIE, token, max_age
+        )
+    };
+    ctx.append_http_header("Set-Cookie", cookie);
+}
+
+fn normalize_email(value: &str) -> async_graphql::Result<String> {
+    let trimmed = value.trim().to_lowercase();
+    if trimmed.is_empty() || !trimmed.contains('@') {
+        return Err(validation_error("Invalid email address"));
+    }
+    Ok(trimmed)
+}
+
+fn validate_display_name(value: &str) -> async_graphql::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(validation_error("displayName is required"));
+    }
+    if trimmed.chars().count() > 100 {
+        return Err(validation_error("displayName must be <= 100 characters"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_roles(values: &[String]) -> async_graphql::Result<Vec<UserRole>> {
+    let mut roles = Vec::new();
+    for value in values {
+        let upper = value.trim().to_uppercase();
+        let role = UserRole::from_str(&upper)
+            .ok_or_else(|| validation_error(format!("Unknown role {}", value)))?;
+        if !roles.iter().any(|r| r.as_str() == role.as_str()) {
+            roles.push(role);
+        }
+    }
+    Ok(roles)
+}
+
+async fn load_roles(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+) -> async_graphql::Result<Vec<UserRole>> {
+    let rows = user_role::Entity::find()
+        .filter(user_role::Column::UserId.eq(user_id))
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| UserRole::from_str(row.role.to_string().as_str()))
+        .collect())
+}
+
+async fn load_roles_for_users(
+    db: &DatabaseConnection,
+    users: &[user::Model],
+) -> async_graphql::Result<HashMap<Uuid, Vec<UserRole>>> {
+    let ids: Vec<Uuid> = users.iter().map(|u| u.id).collect();
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = user_role::Entity::find()
+        .filter(user_role::Column::UserId.is_in(ids.clone()))
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    let mut map: HashMap<Uuid, Vec<UserRole>> = HashMap::new();
+    for row in rows {
+        if let Some(role) = UserRole::from_str(row.role.to_string().as_str()) {
+            map.entry(row.user_id).or_default().push(role);
+        }
+    }
+    Ok(map)
+}
+
+async fn insert_roles<C>(
+    conn: &C,
+    user_id: Uuid,
+    roles: &[UserRole],
+) -> async_graphql::Result<()>
+where
+    C: ConnectionTrait,
+{
+    for role in roles {
+        user_role::ActiveModel {
+            user_id: Set(user_id),
+            role: Set(match role {
+                UserRole::Owner => user_role::Role::Owner,
+                UserRole::Admin => user_role::Role::Admin,
+                UserRole::Sales => user_role::Role::Sales,
+                UserRole::Viewer => user_role::Role::Viewer,
+            }),
+        }
+        .insert(conn)
+        .await
+        .map_err(db_error)?;
+    }
+    Ok(())
+}
+
+async fn load_user_with_roles(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+) -> async_graphql::Result<(user::Model, Vec<UserRole>)> {
+    let model = user::Entity::find_by_id(user_id)
+        .one(db)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| error_with_code("UNAUTHENTICATED", "User not found"))?;
+    if !model.is_active {
+        return Err(error_with_code("FORBIDDEN", "Account disabled"));
+    }
+    let roles = load_roles(db, user_id).await?;
+    Ok((model, roles))
+}
+
+async fn ensure_active_user(
+    db: &DatabaseConnection,
+    user_id: Uuid,
+) -> async_graphql::Result<Uuid> {
+    let user = user::Entity::find_by_id(user_id)
+        .one(db)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| error_with_code("NOT_FOUND", "User not found"))?;
+    if !user.is_active {
+        return Err(error_with_code("VALIDATION", "User is inactive"));
+    }
+    Ok(user_id)
 }
 
 fn validate_task_title(value: &str) -> async_graphql::Result<String> {
