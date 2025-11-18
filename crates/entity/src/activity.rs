@@ -19,16 +19,16 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "super::user::Entity",
+        belongs_to = "super::app_user::Entity",
         from = "Column::CreatedBy",
-        to = "super::user::Column::Id",
+        to = "super::app_user::Column::Id",
         on_delete = "SetNull"
     )]
     CreatedByUser,
     #[sea_orm(
-        belongs_to = "super::user::Entity",
+        belongs_to = "super::app_user::Entity",
         from = "Column::UpdatedBy",
-        to = "super::user::Column::Id",
+        to = "super::app_user::Column::Id",
         on_delete = "SetNull"
     )]
     UpdatedByUser,

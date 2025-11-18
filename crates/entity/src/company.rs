@@ -31,17 +31,17 @@ impl RelationTrait for Relation {
         match self {
             Self::Contact => Entity::has_many(super::contact::Entity).into(),
             Self::Deal => Entity::has_many(super::deal::Entity).into(),
-            Self::AssignedUser => Entity::belongs_to(super::user::Entity)
+            Self::AssignedUser => Entity::belongs_to(super::app_user::Entity)
                 .from(Column::AssignedUserId)
-                .to(super::user::Column::Id)
+                .to(super::app_user::Column::Id)
                 .into(),
-            Self::CreatedByUser => Entity::belongs_to(super::user::Entity)
+            Self::CreatedByUser => Entity::belongs_to(super::app_user::Entity)
                 .from(Column::CreatedBy)
-                .to(super::user::Column::Id)
+                .to(super::app_user::Column::Id)
                 .into(),
-            Self::UpdatedByUser => Entity::belongs_to(super::user::Entity)
+            Self::UpdatedByUser => Entity::belongs_to(super::app_user::Entity)
                 .from(Column::UpdatedBy)
-                .to(super::user::Column::Id)
+                .to(super::app_user::Column::Id)
                 .into(),
         }
     }
@@ -59,7 +59,7 @@ impl Related<super::deal::Entity> for Entity {
     }
 }
 
-impl Related<super::user::Entity> for Entity {
+impl Related<super::app_user::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::AssignedUser.def()
     }

@@ -35,17 +35,17 @@ impl RelationTrait for Relation {
                 .from(Column::CompanyId)
                 .to(super::company::Column::Id)
                 .into(),
-            Self::AssignedUser => Entity::belongs_to(super::user::Entity)
+            Self::AssignedUser => Entity::belongs_to(super::app_user::Entity)
                 .from(Column::AssignedUserId)
-                .to(super::user::Column::Id)
+                .to(super::app_user::Column::Id)
                 .into(),
-            Self::CreatedByUser => Entity::belongs_to(super::user::Entity)
+            Self::CreatedByUser => Entity::belongs_to(super::app_user::Entity)
                 .from(Column::CreatedBy)
-                .to(super::user::Column::Id)
+                .to(super::app_user::Column::Id)
                 .into(),
-            Self::UpdatedByUser => Entity::belongs_to(super::user::Entity)
+            Self::UpdatedByUser => Entity::belongs_to(super::app_user::Entity)
                 .from(Column::UpdatedBy)
-                .to(super::user::Column::Id)
+                .to(super::app_user::Column::Id)
                 .into(),
         }
     }

@@ -1,21 +1,12 @@
-use crate::auth::{issue_token, AuthConfig, CurrentUser, UserRole, SESSION_COOKIE};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
-use argon2::password_hash::{
-    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-};
-use argon2::Argon2;
+use crate::auth::{CurrentUser, UserRole};
 use async_graphql::{
     Context, EmptySubscription, Enum, Error, ErrorExtensions, InputObject, Json, Object, Schema,
     SimpleObject, ID,
 };
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use entity::{
-    activity, company, contact, deal, deal_stage_history, stage_meta, task, user, user_identity,
-    user_role, user_secret,
+    activity, app_user, company, contact, deal, deal_stage_history, stage_meta, task,
+    user_identity, user_role,
 };
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, Func, OnConflict, SimpleExpr};
@@ -25,18 +16,18 @@ use sea_orm::{
     QuerySelect, Select, Statement, TransactionTrait, Value,
 };
 use serde_json::json;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tracing::info_span;
 use uuid::Uuid;
 
 pub struct AppSchema(pub Schema<QueryRoot, MutationRoot, EmptySubscription>);
 
-pub fn build_schema(
-    db: Arc<DatabaseConnection>,
-    auth: Arc<AuthConfig>,
-) -> AppSchema {
+pub fn build_schema(db: Arc<DatabaseConnection>) -> AppSchema {
     let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
         .data(db)
-        .data(auth)
         .finish();
     AppSchema(schema)
 }
@@ -91,15 +82,11 @@ pub struct CrmMutation;
 
 #[Object]
 impl CrmQuery {
-    async fn me(&self, ctx: &Context<'_>) -> async_graphql::Result<MePayload> {
-        let viewer = require_viewer(ctx)?;
+    async fn me(&self, ctx: &Context<'_>) -> async_graphql::Result<UserNode> {
+        let viewer = current_user(ctx)?;
         let db = database(ctx)?;
         let (model, roles) = load_user_with_roles(db.as_ref(), viewer.user_id).await?;
-        let node = UserNode::from_model(model, roles.clone());
-        Ok(MePayload {
-            user: node,
-            roles: roles.iter().map(|r| r.as_str().to_string()).collect(),
-        })
+        Ok(UserNode::from_model(model, roles))
     }
 
     async fn users(
@@ -109,21 +96,20 @@ impl CrmQuery {
         offset: Option<i32>,
         q: Option<String>,
     ) -> async_graphql::Result<Vec<UserNode>> {
-        require_role(ctx, UserRole::Admin)?;
         let db = database(ctx)?;
         let limit = first.unwrap_or(50).clamp(1, 200) as u64;
         let skip = offset.unwrap_or(0).max(0) as u64;
-        let mut query = user::Entity::find();
+        let mut query = app_user::Entity::find();
         if let Some(filter) = sanitize_optional_filter(q) {
             let pattern = format!("%{}%", filter);
             query = query.filter(
                 Condition::any()
-                    .add(user::Column::Email.ilike(pattern.clone()))
-                    .add(user::Column::DisplayName.ilike(pattern)),
+                    .add(app_user::Column::Email.like(pattern.clone()))
+                    .add(app_user::Column::DisplayName.like(pattern)),
             );
         }
         let records = query
-            .order_by_asc(user::Column::Email)
+            .order_by_asc(app_user::Column::Email)
             .limit(limit)
             .offset(skip)
             .all(db.as_ref())
@@ -147,7 +133,6 @@ impl CrmQuery {
         first: Option<i32>,
         offset: Option<i32>,
     ) -> async_graphql::Result<Vec<SearchHit>> {
-        require_viewer(ctx)?;
         let db = database(ctx)?;
         let trimmed = validate_search_query(&q)?;
         let requested = first.unwrap_or(20);
@@ -163,7 +148,6 @@ impl CrmQuery {
         q: String,
         first: Option<i32>,
     ) -> async_graphql::Result<Vec<CompanyNode>> {
-        require_viewer(ctx)?;
         let db = database(ctx)?;
         let trimmed = validate_search_query(&q)?;
         let requested = first.unwrap_or(10);
@@ -193,7 +177,6 @@ impl CrmQuery {
         q: String,
         first: Option<i32>,
     ) -> async_graphql::Result<Vec<ContactNode>> {
-        require_viewer(ctx)?;
         let db = database(ctx)?;
         let trimmed = validate_search_query(&q)?;
         let requested = first.unwrap_or(10);
@@ -223,7 +206,6 @@ impl CrmQuery {
         q: String,
         first: Option<i32>,
     ) -> async_graphql::Result<Vec<DealNode>> {
-        require_viewer(ctx)?;
         let db = database(ctx)?;
         let trimmed = validate_search_query(&q)?;
         let requested = first.unwrap_or(10);
@@ -255,7 +237,6 @@ impl CrmQuery {
         first: Option<i32>,
         offset: Option<i32>,
     ) -> async_graphql::Result<Vec<DealStageHistoryNode>> {
-        require_viewer(ctx)?;
         let db = database(ctx)?;
         let deal_uuid = parse_uuid(&deal_id)?;
         let limit = first.unwrap_or(50).clamp(1, 200) as u64;
@@ -281,7 +262,6 @@ impl CrmQuery {
         first: Option<i32>,
         offset: Option<i32>,
     ) -> async_graphql::Result<Vec<ActivityNode>> {
-        require_viewer(ctx)?;
         let db = database(ctx)?;
         let deal_uuid = parse_uuid(&deal_id)?;
         let limit = first.unwrap_or(50).clamp(1, 200) as u64;
@@ -309,7 +289,6 @@ impl CrmQuery {
         filter: Option<TaskFilter>,
         #[graphql(name = "orderBy", default)] order_by: TaskOrder,
     ) -> async_graphql::Result<Vec<TaskNode>> {
-        require_viewer(ctx)?;
         let db = database(ctx)?;
         let requested = first.unwrap_or(25);
         let limit = enforce_task_limit(requested)?;
@@ -392,7 +371,6 @@ impl CrmQuery {
 
     #[graphql(name = "task")]
     async fn task(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<Option<TaskNode>> {
-        require_viewer(ctx)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let record = task::Entity::find_by_id(task_id)
@@ -406,7 +384,6 @@ impl CrmQuery {
         &self,
         ctx: &Context<'_>,
     ) -> async_graphql::Result<Vec<PipelineStage>> {
-        require_viewer(ctx)?;
         let db = database(ctx)?;
         let stages = load_stage_meta(db.as_ref()).await?;
         Ok(stages.iter().map(PipelineStage::from).collect())
@@ -422,7 +399,6 @@ impl CrmQuery {
         q: Option<String>,
         #[graphql(name = "orderByUpdated")] order_by_updated: Option<bool>,
     ) -> async_graphql::Result<PipelineBoard> {
-        require_viewer(ctx)?;
         let db = database(ctx)?;
         let requested = first_per_stage.unwrap_or(25);
         if requested < 0 {
@@ -526,7 +502,6 @@ impl CrmQuery {
         group: Option<TimeGroup>,
         #[graphql(name = "includeLost")] include_lost: Option<bool>,
     ) -> async_graphql::Result<PipelineReport> {
-        require_viewer(ctx)?;
         if range.from > range.to {
             return Err(validation_error("range.from must be on or before range.to"));
         }
@@ -575,212 +550,6 @@ impl CrmQuery {
 
 #[Object]
 impl CrmMutation {
-    async fn login(
-        &self,
-        ctx: &Context<'_>,
-        email: String,
-        password: String,
-    ) -> async_graphql::Result<AuthPayload> {
-        let auth = auth_config(ctx)?;
-        if !auth.local_auth_enabled {
-            return Err(error_with_code("FORBIDDEN", "Local authentication is disabled"));
-        }
-        let db = database(ctx)?;
-        let normalized = normalize_email(&email)?;
-        let identity = user_identity::Entity::find()
-            .filter(user_identity::Column::Provider.eq("local"))
-            .filter(user_identity::Column::Subject.eq(normalized.clone()))
-            .one(db.as_ref())
-            .await
-            .map_err(db_error)?;
-        let Some(identity) = identity else {
-            return Ok(AuthPayload {
-                ok: false,
-                user: None,
-                error: Some("Invalid credentials".into()),
-            });
-        };
-        let user = user::Entity::find_by_id(identity.user_id)
-            .one(db.as_ref())
-            .await
-            .map_err(db_error)?;
-        let Some(user) = user else {
-            return Ok(AuthPayload {
-                ok: false,
-                user: None,
-                error: Some("Invalid credentials".into()),
-            });
-        };
-        if !user.is_active {
-            return Ok(AuthPayload {
-                ok: false,
-                user: None,
-                error: Some("Account disabled".into()),
-            });
-        }
-        let secret = user_secret::Entity::find_by_id(user.id)
-            .one(db.as_ref())
-            .await
-            .map_err(db_error)?;
-        let Some(secret) = secret else {
-            return Ok(AuthPayload {
-                ok: false,
-                user: None,
-                error: Some("Invalid credentials".into()),
-            });
-        };
-        let parsed_hash = PasswordHash::new(&secret.password_hash)
-            .map_err(|_| error_with_code("INTERNAL", "Invalid password hash"))?;
-        if Argon2::default()
-            .verify_password(password.as_bytes(), &parsed_hash)
-            .is_err()
-        {
-            return Ok(AuthPayload {
-                ok: false,
-                user: None,
-                error: Some("Invalid credentials".into()),
-            });
-        }
-        let roles = load_roles(db.as_ref(), user.id).await?;
-        let token = issue_token(user.id, &roles, &auth)
-            .map_err(|_| error_with_code("INTERNAL", "Failed to issue session token"))?;
-        append_session_cookie(ctx, &token, auth.session_ttl_minutes);
-        Ok(AuthPayload {
-            ok: true,
-            user: Some(UserNode::from_model(user, roles)),
-            error: None,
-        })
-    }
-
-    async fn logout(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {
-        append_session_cookie(ctx, "", -1);
-        Ok(true)
-    }
-
-    async fn get_auth_url(
-        &self,
-        ctx: &Context<'_>,
-        provider: String,
-    ) -> async_graphql::Result<String> {
-        let auth = auth_config(ctx)?;
-        if !auth.oidc_enabled {
-            return Err(error_with_code(
-                "VALIDATION",
-                format!("OIDC provider {} is not configured", provider),
-            ));
-        }
-        Err(error_with_code(
-            "NOT_IMPLEMENTED",
-            "OIDC integrations are not yet configured",
-        ))
-    }
-
-    async fn handle_oidc_callback(
-        &self,
-        _ctx: &Context<'_>,
-        _provider: String,
-        _code: String,
-        _state: String,
-    ) -> async_graphql::Result<AuthPayload> {
-        Err(error_with_code(
-            "NOT_IMPLEMENTED",
-            "OIDC integrations are not yet configured",
-        ))
-    }
-
-    async fn create_user(
-        &self,
-        ctx: &Context<'_>,
-        input: NewUserInput,
-    ) -> async_graphql::Result<UserNode> {
-        require_role(ctx, UserRole::Admin)?;
-        let db = database(ctx)?;
-        let email = normalize_email(&input.email)?;
-        let display_name = validate_display_name(&input.display_name)?;
-        let roles = parse_roles(&input.roles)?;
-        if roles.is_empty() {
-            return Err(validation_error("roles must include at least one entry"));
-        }
-        let txn = db.begin().await.map_err(db_error)?;
-        let now: DateTimeWithTimeZone = Utc::now().into();
-        let user_id = Uuid::new_v4();
-        user::ActiveModel {
-            id: Set(user_id),
-            email: Set(email.clone()),
-            display_name: Set(display_name),
-            avatar_url: Set(None),
-            is_active: Set(true),
-            created_at: Set(now),
-            updated_at: Set(now),
-        }
-        .insert(&txn)
-        .await
-        .map_err(db_error)?;
-        user_identity::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            user_id: Set(user_id),
-            provider: Set("local".into()),
-            subject: Set(email),
-            created_at: Set(now),
-        }
-        .insert(&txn)
-        .await
-        .map_err(db_error)?;
-        insert_roles(&txn, user_id, &roles).await?;
-        txn.commit().await.map_err(db_error)?;
-        let record = user::Entity::find_by_id(user_id)
-            .one(db.as_ref())
-            .await
-            .map_err(db_error)?
-            .ok_or_else(|| error_with_code("INTERNAL", "Failed to load new user"))?;
-        Ok(UserNode::from_model(record, roles))
-    }
-
-    async fn update_user(
-        &self,
-        ctx: &Context<'_>,
-        input: UpdateUserInput,
-    ) -> async_graphql::Result<UserNode> {
-        require_role(ctx, UserRole::Admin)?;
-        let db = database(ctx)?;
-        let user_id = parse_uuid(&input.id)?;
-        let mut model = user::Entity::find_by_id(user_id)
-            .one(db.as_ref())
-            .await
-            .map_err(db_error)?
-            .ok_or_else(|| error_with_code("NOT_FOUND", "User not found"))?;
-        if let Some(display_name) = &input.display_name {
-            model.display_name = validate_display_name(display_name)?;
-        }
-        if let Some(is_active) = input.is_active {
-            model.is_active = is_active;
-        }
-        model.updated_at = Utc::now().into();
-        let mut active: user::ActiveModel = model.clone().into();
-        if let Some(display_name) = &input.display_name {
-            active.display_name = Set(display_name.trim().to_string());
-        }
-        if let Some(is_active) = input.is_active {
-            active.is_active = Set(is_active);
-        }
-        active.updated_at = Set(Utc::now().into());
-        let updated = active.update(db.as_ref()).await.map_err(db_error)?;
-        let mut roles = load_roles(db.as_ref(), user_id).await?;
-        if let Some(role_values) = input.roles {
-            let parsed = parse_roles(&role_values)?;
-            let txn = db.begin().await.map_err(db_error)?;
-            user_role::Entity::delete_many()
-                .filter(user_role::Column::UserId.eq(user_id))
-                .exec(&txn)
-                .await
-                .map_err(db_error)?;
-            insert_roles(&txn, user_id, &parsed).await?;
-            txn.commit().await.map_err(db_error)?;
-            roles = parsed;
-        }
-        Ok(UserNode::from_model(updated, roles))
-    }
-
     #[graphql(name = "assignCompany")]
     async fn assign_company(
         &self,
@@ -788,7 +557,7 @@ impl CrmMutation {
         id: ID,
         #[graphql(name = "userId")] user_id: Option<ID>,
     ) -> async_graphql::Result<CompanyNode> {
-        let current = require_role(ctx, UserRole::Sales)?;
+        let current = current_user(ctx)?;
         let db = database(ctx)?;
         let company_id = parse_uuid(&id)?;
         let target_user = match user_id {
@@ -816,7 +585,7 @@ impl CrmMutation {
         id: ID,
         #[graphql(name = "userId")] user_id: Option<ID>,
     ) -> async_graphql::Result<ContactNode> {
-        let current = require_role(ctx, UserRole::Sales)?;
+        let current = current_user(ctx)?;
         let db = database(ctx)?;
         let contact_id = parse_uuid(&id)?;
         let target_user = match user_id {
@@ -844,7 +613,7 @@ impl CrmMutation {
         id: ID,
         #[graphql(name = "userId")] user_id: Option<ID>,
     ) -> async_graphql::Result<DealNode> {
-        let current = require_role(ctx, UserRole::Sales)?;
+        let current = current_user(ctx)?;
         let db = database(ctx)?;
         let deal_id = parse_uuid(&id)?;
         let target_user = match user_id {
@@ -872,7 +641,7 @@ impl CrmMutation {
         id: ID,
         #[graphql(name = "userId")] user_id: Option<ID>,
     ) -> async_graphql::Result<TaskNode> {
-        let current = require_role(ctx, UserRole::Sales)?;
+        let current = current_user(ctx)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let target_user = match user_id {
@@ -900,15 +669,20 @@ impl CrmMutation {
         stage: DealStage,
         note: Option<String>,
     ) -> async_graphql::Result<DealNode> {
-        let current = require_role(ctx, UserRole::Sales)?;
+        let current = current_user(ctx)?;
         let db = database(ctx)?;
         let deal_id = parse_uuid(&id)?;
         let target_stage: deal::Stage = stage.into();
 
-        let model =
-            move_deal_stage_internal(db.as_ref(), deal_id, target_stage, note, Some(current.user_id))
-            .await
-            .map_err(stage_move_error)?;
+        let model = move_deal_stage_internal(
+            db.as_ref(),
+            deal_id,
+            target_stage,
+            note,
+            Some(current.user_id),
+        )
+        .await
+        .map_err(stage_move_error)?;
 
         Ok(model.into())
     }
@@ -919,7 +693,7 @@ impl CrmMutation {
         ctx: &Context<'_>,
         input: NewTaskInput,
     ) -> async_graphql::Result<TaskNode> {
-        let current = require_role(ctx, UserRole::Sales)?;
+        let current = current_user(ctx)?;
         let db = database(ctx)?;
         let span = info_span!(
             "crm.tasks.create",
@@ -940,7 +714,7 @@ impl CrmMutation {
         ctx: &Context<'_>,
         input: UpdateTaskInput,
     ) -> async_graphql::Result<TaskNode> {
-        let current = require_role(ctx, UserRole::Sales)?;
+        let current = current_user(ctx)?;
         let db = database(ctx)?;
         let task = update_task_internal(db.as_ref(), input, &current).await?;
         Ok(task.into())
@@ -948,7 +722,7 @@ impl CrmMutation {
 
     #[graphql(name = "completeTask")]
     async fn complete_task(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<TaskNode> {
-        let current = require_role(ctx, UserRole::Sales)?;
+        let current = current_user(ctx)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let existing = task::Entity::find_by_id(task_id)
@@ -980,7 +754,7 @@ impl CrmMutation {
 
     #[graphql(name = "cancelTask")]
     async fn cancel_task(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<TaskNode> {
-        let current = require_role(ctx, UserRole::Sales)?;
+        let current = current_user(ctx)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let existing = task::Entity::find_by_id(task_id)
@@ -1012,7 +786,7 @@ impl CrmMutation {
 
     #[graphql(name = "reopenTask")]
     async fn reopen_task(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<TaskNode> {
-        let current = require_role(ctx, UserRole::Sales)?;
+        let current = current_user(ctx)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let existing = task::Entity::find_by_id(task_id)
@@ -1031,20 +805,15 @@ impl CrmMutation {
             first = 0
         );
         let _guard = span.enter();
-        let task = transition_task_status(
-            db.as_ref(),
-            existing,
-            task::Status::Open,
-            None,
-            &current,
-        )
-        .await?;
+        let task =
+            transition_task_status(db.as_ref(), existing, task::Status::Open, None, &current)
+                .await?;
         Ok(task.into())
     }
 
     #[graphql(name = "deleteTask")]
     async fn delete_task(&self, ctx: &Context<'_>, id: ID) -> async_graphql::Result<bool> {
-        require_role(ctx, UserRole::Sales)?;
+        current_user(ctx)?;
         let db = database(ctx)?;
         let task_id = parse_uuid(&id)?;
         let res = task::Entity::delete_by_id(task_id)
@@ -1514,7 +1283,7 @@ pub struct UserNode {
 }
 
 impl UserNode {
-    fn from_model(model: user::Model, roles: Vec<UserRole>) -> Self {
+    fn from_model(model: app_user::Model, roles: Vec<UserRole>) -> Self {
         Self {
             id: ID::from(model.id.to_string()),
             email: model.email,
@@ -1526,37 +1295,6 @@ impl UserNode {
             updated_at: model.updated_at.into(),
         }
     }
-}
-
-#[derive(Clone, Debug, SimpleObject)]
-pub struct MePayload {
-    pub user: UserNode,
-    pub roles: Vec<String>,
-}
-
-#[derive(Clone, Debug, SimpleObject, Default)]
-pub struct AuthPayload {
-    pub ok: bool,
-    pub user: Option<UserNode>,
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Debug, InputObject)]
-pub struct NewUserInput {
-    pub email: String,
-    #[graphql(name = "displayName")]
-    pub display_name: String,
-    pub roles: Vec<String>,
-}
-
-#[derive(Clone, Debug, InputObject)]
-pub struct UpdateUserInput {
-    pub id: ID,
-    #[graphql(name = "displayName")]
-    pub display_name: Option<String>,
-    pub roles: Option<Vec<String>>,
-    #[graphql(name = "isActive")]
-    pub is_active: Option<bool>,
 }
 
 #[derive(Clone, Debug, SimpleObject)]
@@ -1804,29 +1542,10 @@ fn database(ctx: &Context<'_>) -> async_graphql::Result<Arc<DatabaseConnection>>
         .map_err(|_| error_with_code("INTERNAL", "Missing database connection"))
 }
 
-fn auth_config(ctx: &Context<'_>) -> async_graphql::Result<Arc<AuthConfig>> {
-    ctx.data::<Arc<AuthConfig>>()
-        .cloned()
-        .map_err(|_| error_with_code("INTERNAL", "Missing auth configuration"))
-}
-
 fn current_user(ctx: &Context<'_>) -> async_graphql::Result<CurrentUser> {
     ctx.data::<CurrentUser>()
         .cloned()
         .map_err(|_| error_with_code("UNAUTHENTICATED", "Login required"))
-}
-
-fn require_role(ctx: &Context<'_>, role: UserRole) -> async_graphql::Result<CurrentUser> {
-    let user = current_user(ctx)?;
-    if user.has_role(role) {
-        Ok(user)
-    } else {
-        Err(error_with_code("FORBIDDEN", "Insufficient permissions"))
-    }
-}
-
-fn require_viewer(ctx: &Context<'_>) -> async_graphql::Result<CurrentUser> {
-    require_role(ctx, UserRole::Viewer)
 }
 
 fn parse_uuid(id: &ID) -> async_graphql::Result<Uuid> {
@@ -1843,14 +1562,14 @@ fn error_with_code(code: &'static str, message: impl Into<String>) -> Error {
 
 #[derive(Debug, Clone)]
 pub struct SeededCrmRecords {
-    pub users: Vec<user::Model>,
+    pub users: Vec<app_user::Model>,
     pub companies: Vec<company::Model>,
-   pub contacts: Vec<contact::Model>,
-   pub deals: Vec<deal::Model>,
+    pub contacts: Vec<contact::Model>,
+    pub deals: Vec<deal::Model>,
 }
 
 impl SeededCrmRecords {
-    pub fn user_email(&self, email: &str) -> Option<&user::Model> {
+    pub fn user_email(&self, email: &str) -> Option<&app_user::Model> {
         self.users.iter().find(|u| u.email == email)
     }
 
@@ -1875,25 +1594,12 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         "owner@sme.test",
         "Owner One",
         &[user_role::Role::Owner, user_role::Role::Admin],
-        "ownerpass",
     )
     .await?;
-    let admin = insert_seed_user(
-        db,
-        "admin@sme.test",
-        "Admin Ada",
-        &[user_role::Role::Admin],
-        "adminpass",
-    )
-    .await?;
-    let sales = insert_seed_user(
-        db,
-        "sales@sme.test",
-        "Sales Sam",
-        &[user_role::Role::Sales],
-        "salespass",
-    )
-    .await?;
+    let admin =
+        insert_seed_user(db, "admin@sme.test", "Admin Ada", &[user_role::Role::Admin]).await?;
+    let sales =
+        insert_seed_user(db, "sales@sme.test", "Sales Sam", &[user_role::Role::Sales]).await?;
     let acme = company::ActiveModel {
         id: Set(Uuid::new_v4()),
         name: Set("ACME, Inc.".into()),
@@ -2184,10 +1890,9 @@ async fn insert_seed_user(
     email: &str,
     display_name: &str,
     roles: &[user_role::Role],
-    password: &str,
-) -> Result<user::Model, DbErr> {
+) -> Result<app_user::Model, DbErr> {
     let now: DateTimeWithTimeZone = Utc::now().into();
-    let model = user::ActiveModel {
+    let model = app_user::ActiveModel {
         id: Set(Uuid::new_v4()),
         email: Set(email.to_string()),
         display_name: Set(display_name.to_string()),
@@ -2207,13 +1912,6 @@ async fn insert_seed_user(
     }
     .insert(db)
     .await?;
-    user_secret::ActiveModel {
-        user_id: Set(model.id),
-        password_hash: Set(hash_password(password)?),
-        updated_at: Set(now),
-    }
-    .insert(db)
-    .await?;
     for role in roles {
         user_role::ActiveModel {
             user_id: Set(model.id),
@@ -2223,14 +1921,6 @@ async fn insert_seed_user(
         .await?;
     }
     Ok(model)
-}
-
-fn hash_password(password: &str) -> Result<String, DbErr> {
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map(|hash| hash.to_string())
-        .map_err(|err| DbErr::Custom(format!("hash error: {}", err)))
 }
 
 const STAGE_META_DEFAULTS: [(&str, &str, i16, i16, bool, bool); 6] = [
@@ -3032,54 +2722,6 @@ fn percentile(values: &[f64], percentile: f64) -> f64 {
     values[idx]
 }
 
-fn append_session_cookie(ctx: &Context<'_>, token: &str, ttl_minutes: i64) {
-    let max_age = (ttl_minutes.max(0) * 60).to_string();
-    let cookie = if ttl_minutes < 0 {
-        format!(
-            "{}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax",
-            SESSION_COOKIE
-        )
-    } else {
-        format!(
-            "{}={}; Max-Age={}; Path=/; HttpOnly; SameSite=Lax",
-            SESSION_COOKIE, token, max_age
-        )
-    };
-    ctx.append_http_header("Set-Cookie", cookie);
-}
-
-fn normalize_email(value: &str) -> async_graphql::Result<String> {
-    let trimmed = value.trim().to_lowercase();
-    if trimmed.is_empty() || !trimmed.contains('@') {
-        return Err(validation_error("Invalid email address"));
-    }
-    Ok(trimmed)
-}
-
-fn validate_display_name(value: &str) -> async_graphql::Result<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(validation_error("displayName is required"));
-    }
-    if trimmed.chars().count() > 100 {
-        return Err(validation_error("displayName must be <= 100 characters"));
-    }
-    Ok(trimmed.to_string())
-}
-
-fn parse_roles(values: &[String]) -> async_graphql::Result<Vec<UserRole>> {
-    let mut roles = Vec::new();
-    for value in values {
-        let upper = value.trim().to_uppercase();
-        let role = UserRole::from_str(&upper)
-            .ok_or_else(|| validation_error(format!("Unknown role {}", value)))?;
-        if !roles.iter().any(|r| r.as_str() == role.as_str()) {
-            roles.push(role);
-        }
-    }
-    Ok(roles)
-}
-
 async fn load_roles(
     db: &DatabaseConnection,
     user_id: Uuid,
@@ -3091,13 +2733,18 @@ async fn load_roles(
         .map_err(db_error)?;
     Ok(rows
         .into_iter()
-        .filter_map(|row| UserRole::from_str(row.role.to_string().as_str()))
+        .filter_map(|row| match row.role {
+            user_role::Role::Owner => Some(UserRole::Owner),
+            user_role::Role::Admin => Some(UserRole::Admin),
+            user_role::Role::Sales => Some(UserRole::Sales),
+            user_role::Role::Viewer => Some(UserRole::Viewer),
+        })
         .collect())
 }
 
 async fn load_roles_for_users(
     db: &DatabaseConnection,
-    users: &[user::Model],
+    users: &[app_user::Model],
 ) -> async_graphql::Result<HashMap<Uuid, Vec<UserRole>>> {
     let ids: Vec<Uuid> = users.iter().map(|u| u.id).collect();
     if ids.is_empty() {
@@ -3110,43 +2757,22 @@ async fn load_roles_for_users(
         .map_err(db_error)?;
     let mut map: HashMap<Uuid, Vec<UserRole>> = HashMap::new();
     for row in rows {
-        if let Some(role) = UserRole::from_str(row.role.to_string().as_str()) {
-            map.entry(row.user_id).or_default().push(role);
-        }
+        let role = match row.role {
+            user_role::Role::Owner => UserRole::Owner,
+            user_role::Role::Admin => UserRole::Admin,
+            user_role::Role::Sales => UserRole::Sales,
+            user_role::Role::Viewer => UserRole::Viewer,
+        };
+        map.entry(row.user_id).or_default().push(role);
     }
     Ok(map)
-}
-
-async fn insert_roles<C>(
-    conn: &C,
-    user_id: Uuid,
-    roles: &[UserRole],
-) -> async_graphql::Result<()>
-where
-    C: ConnectionTrait,
-{
-    for role in roles {
-        user_role::ActiveModel {
-            user_id: Set(user_id),
-            role: Set(match role {
-                UserRole::Owner => user_role::Role::Owner,
-                UserRole::Admin => user_role::Role::Admin,
-                UserRole::Sales => user_role::Role::Sales,
-                UserRole::Viewer => user_role::Role::Viewer,
-            }),
-        }
-        .insert(conn)
-        .await
-        .map_err(db_error)?;
-    }
-    Ok(())
 }
 
 async fn load_user_with_roles(
     db: &DatabaseConnection,
     user_id: Uuid,
-) -> async_graphql::Result<(user::Model, Vec<UserRole>)> {
-    let model = user::Entity::find_by_id(user_id)
+) -> async_graphql::Result<(app_user::Model, Vec<UserRole>)> {
+    let model = app_user::Entity::find_by_id(user_id)
         .one(db)
         .await
         .map_err(db_error)?
@@ -3158,11 +2784,8 @@ async fn load_user_with_roles(
     Ok((model, roles))
 }
 
-async fn ensure_active_user(
-    db: &DatabaseConnection,
-    user_id: Uuid,
-) -> async_graphql::Result<Uuid> {
-    let user = user::Entity::find_by_id(user_id)
+async fn ensure_active_user(db: &DatabaseConnection, user_id: Uuid) -> async_graphql::Result<Uuid> {
+    let user = app_user::Entity::find_by_id(user_id)
         .one(db)
         .await
         .map_err(db_error)?

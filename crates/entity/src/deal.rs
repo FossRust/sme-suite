@@ -29,9 +29,9 @@ pub enum Relation {
     )]
     Company,
     #[sea_orm(
-        belongs_to = "super::user::Entity",
+        belongs_to = "super::app_user::Entity",
         from = "Column::AssignedUserId",
-        to = "super::user::Column::Id"
+        to = "super::app_user::Column::Id"
     )]
     AssignedUser,
 }
@@ -42,7 +42,7 @@ impl Related<super::company::Entity> for Entity {
     }
 }
 
-impl Related<super::user::Entity> for Entity {
+impl Related<super::app_user::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::AssignedUser.def()
     }

@@ -1,17 +1,16 @@
 use api::{
-    auth::{decode_token, AuthConfig, CurrentUser, UserRole, SESSION_COOKIE},
+    auth::{CurrentUser, UserRole},
     schema::{build_schema, AppSchema},
 };
 use async_graphql::{http::GraphiQLSource, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::{extract::State, http::HeaderMap, routing::get, Router};
+use axum::{extract::State, routing::get, Router};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
-use entity::{user, user_role};
+use entity::{app_user, user_role};
 use migration::{Migrator, MigratorTrait};
-use sea_orm::{Database, DatabaseConnection, EntityTrait, QueryFilter};
-use sea_orm::{ColumnTrait};
+use sea_orm::{ColumnTrait, Database, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use tower_http::{
@@ -48,13 +47,11 @@ enum Cmd {
 
 #[derive(Clone)]
 struct AppState {
-    schema: Schema<
-        api::schema::QueryRoot,
-        api::schema::MutationRoot,
-        async_graphql::EmptySubscription,
-    >,
+    schema:
+        Schema<api::schema::QueryRoot, api::schema::MutationRoot, async_graphql::EmptySubscription>,
+    #[allow(dead_code)]
     db: Arc<DatabaseConnection>,
-    auth: Arc<AuthConfig>,
+    current_user: CurrentUser,
 }
 
 #[tokio::main]
@@ -73,7 +70,6 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => "postgres://sme_suite:sme_suite@localhost:5432/sme_suite".to_string(),
     };
     let db = Arc::new(Database::connect(&db_url).await?);
-    let auth = Arc::new(load_auth_config());
 
     match cli.cmd {
         Cmd::Migrate { action } => {
@@ -90,17 +86,18 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::PrintSchema => {
-            let AppSchema(schema) = build_schema(db.clone(), auth.clone());
+            let AppSchema(schema) = build_schema(db.clone());
             println!("{}", schema.sdl());
             Ok(())
         }
         Cmd::Serve { bind } => {
             Migrator::up(db.as_ref(), None).await?;
-            let AppSchema(schema) = build_schema(db.clone(), auth.clone());
+            let AppSchema(schema) = build_schema(db.clone());
+            let current_user = load_default_user(db.as_ref()).await?;
             let state = AppState {
                 schema,
                 db: db.clone(),
-                auth: auth.clone(),
+                current_user,
             };
             let app = app_router(state);
 
@@ -134,77 +131,30 @@ fn app_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn graphql_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    req: GraphQLRequest,
-) -> GraphQLResponse {
-    execute_graphql(state, headers, req).await
+async fn graphql_get(State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
+    execute_graphql(state, req).await
 }
 
-async fn graphql_post(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    req: GraphQLRequest,
-) -> GraphQLResponse {
-    execute_graphql(state, headers, req).await
+async fn graphql_post(State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
+    execute_graphql(state, req).await
 }
 
-async fn execute_graphql(
-    state: AppState,
-    headers: HeaderMap,
-    req: GraphQLRequest,
-) -> GraphQLResponse {
+async fn execute_graphql(state: AppState, req: GraphQLRequest) -> GraphQLResponse {
     let mut request = req.into_inner();
-    if let Some(current_user) = authenticate_request(&state, &headers).await {
-        request = request.data(current_user);
-    }
+    request = request.data(state.current_user.clone());
     state.schema.execute(request).await.into()
 }
 
-async fn authenticate_request(state: &AppState, headers: &HeaderMap) -> Option<CurrentUser> {
-    let token = extract_token(headers)?;
-    let claims = decode_token(&token, &state.auth).ok()?;
-    load_current_user(state.db.as_ref(), claims.sub).await
-}
-
-fn extract_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {
-        if let Ok(text) = value.to_str() {
-            if let Some(rest) = text.strip_prefix("Bearer ") {
-                return Some(rest.trim().to_string());
-            }
-        }
-    }
-    if let Some(cookie) = headers.get(axum::http::header::COOKIE) {
-        if let Ok(text) = cookie.to_str() {
-            for part in text.split(';') {
-                let trimmed = part.trim();
-                if let Some(rest) = trimmed.strip_prefix(SESSION_COOKIE) {
-                    if let Some(value) = rest.strip_prefix('=') {
-                        return Some(value.trim().to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-async fn load_current_user(
-    db: &DatabaseConnection,
-    user_id: Uuid,
-) -> Option<CurrentUser> {
-    let user = user::Entity::find_by_id(user_id).one(db).await.ok()??;
-    if !user.is_active {
-        return None;
-    }
+async fn load_default_user(db: &DatabaseConnection) -> anyhow::Result<CurrentUser> {
+    let user = app_user::Entity::find()
+        .order_by_asc(app_user::Column::CreatedAt)
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no users found; run seeds first"))?;
     let roles = user_role::Entity::find()
-        .filter(user_role::Column::UserId.eq(user_id))
+        .filter(user_role::Column::UserId.eq(user.id))
         .all(db)
-        .await
-        .ok()?;
-    let parsed: Vec<UserRole> = roles
+        .await?
         .into_iter()
         .filter_map(|row| match row.role {
             user_role::Role::Owner => Some(UserRole::Owner),
@@ -213,33 +163,10 @@ async fn load_current_user(
             user_role::Role::Viewer => Some(UserRole::Viewer),
         })
         .collect();
-    Some(CurrentUser {
-        user_id,
-        roles: parsed,
+    Ok(CurrentUser {
+        user_id: user.id,
+        roles,
     })
-}
-
-fn load_auth_config() -> AuthConfig {
-    let secret = std::env::var("AUTH_SECRET").unwrap_or_else(|_| "dev-secret".into());
-    let local_auth_enabled = env_bool("LOCAL_AUTH_ENABLED", true);
-    let oidc_enabled = env_bool("OIDC_ENABLED", false);
-    let session_ttl_minutes = std::env::var("SESSION_TTL_MINUTES")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(15);
-    AuthConfig {
-        jwt_secret: secret,
-        local_auth_enabled,
-        oidc_enabled,
-        session_ttl_minutes,
-    }
-}
-
-fn env_bool(var: &str, default: bool) -> bool {
-    std::env::var(var)
-        .ok()
-        .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(default)
 }
 
 async fn graphiql() -> (axum::http::HeaderMap, String) {

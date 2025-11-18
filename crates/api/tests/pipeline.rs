@@ -1,32 +1,24 @@
-use std::sync::Arc;
+mod common;
 
-use api::schema::{build_schema, seed_crm_demo, AppSchema};
+use api::auth::{CurrentUser, UserRole};
 use async_graphql::{Request, Variables};
-use migration::MigratorTrait;
-use sea_orm::Database;
+use common::PgTestContext;
 use serde_json::json;
 
-struct PipelineTestContext {
-    schema: async_graphql::Schema<
-        api::schema::QueryRoot,
-        api::schema::MutationRoot,
-        async_graphql::EmptySubscription,
-    >,
-}
-
-async fn setup_pg() -> Option<PipelineTestContext> {
-    let url = std::env::var("TEST_DATABASE_URL").ok()?;
-    let conn = Database::connect(&url).await.ok()?;
-    let db = Arc::new(conn);
-    migration::Migrator::reset(db.as_ref()).await.ok()?;
-    seed_crm_demo(db.as_ref()).await.ok()?;
-    let AppSchema(schema) = build_schema(db.clone());
-    Some(PipelineTestContext { schema })
+fn owner_user(ctx: &PgTestContext) -> CurrentUser {
+    let owner = ctx
+        .seeded
+        .user_email("owner@sme.test")
+        .expect("seeded owner user");
+    CurrentUser {
+        user_id: owner.id,
+        roles: vec![UserRole::Owner, UserRole::Admin],
+    }
 }
 
 #[tokio::test]
 async fn pipeline_stages_return_defaults() {
-    let Some(ctx) = setup_pg().await else {
+    let Some(ctx) = PgTestContext::new_seeded().await else {
         eprintln!("skipping pipeline tests: TEST_DATABASE_URL not set");
         return;
     };
@@ -44,7 +36,10 @@ async fn pipeline_stages_return_defaults() {
             }
         }
     "#;
-    let resp = ctx.schema.execute(Request::new(query)).await;
+    let resp = ctx
+        .schema
+        .execute(Request::new(query).data(owner_user(&ctx)))
+        .await;
     assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
     let stages = resp.data.into_json().unwrap()["crm"]["pipelineStages"]
         .as_array()
@@ -56,11 +51,12 @@ async fn pipeline_stages_return_defaults() {
     assert_eq!(stages.last().unwrap()["key"], "LOST");
     assert!(stages.iter().any(|stage| stage["isWon"] == true));
     assert!(stages.iter().any(|stage| stage["isLost"] == true));
+    ctx.cleanup().await;
 }
 
 #[tokio::test]
 async fn pipeline_board_returns_columns_and_totals() {
-    let Some(ctx) = setup_pg().await else {
+    let Some(ctx) = PgTestContext::new_seeded().await else {
         eprintln!("skipping pipeline tests: TEST_DATABASE_URL not set");
         return;
     };
@@ -89,7 +85,7 @@ async fn pipeline_board_returns_columns_and_totals() {
     let vars = Variables::from_json(json!({ "first": 2 }));
     let resp = ctx
         .schema
-        .execute(Request::new(query).variables(vars))
+        .execute(Request::new(query).variables(vars).data(owner_user(&ctx)))
         .await;
     assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
     let board = resp.data.into_json().unwrap()["crm"]["pipelineBoard"].clone();
@@ -110,11 +106,12 @@ async fn pipeline_board_returns_columns_and_totals() {
         qualify["deals"].as_array().unwrap().len() <= 2,
         "expected per-stage limit respected"
     );
+    ctx.cleanup().await;
 }
 
 #[tokio::test]
 async fn pipeline_board_enforces_limit() {
-    let Some(ctx) = setup_pg().await else {
+    let Some(ctx) = PgTestContext::new_seeded().await else {
         eprintln!("skipping pipeline tests: TEST_DATABASE_URL not set");
         return;
     };
@@ -127,7 +124,10 @@ async fn pipeline_board_enforces_limit() {
             }
         }
     "#;
-    let resp = ctx.schema.execute(Request::new(query)).await;
+    let resp = ctx
+        .schema
+        .execute(Request::new(query).data(owner_user(&ctx)))
+        .await;
     assert!(
         resp.errors.iter().any(|err| {
             err.extensions
@@ -142,11 +142,12 @@ async fn pipeline_board_enforces_limit() {
         "expected limit error, got {:?}",
         resp.errors
     );
+    ctx.cleanup().await;
 }
 
 #[tokio::test]
 async fn pipeline_report_returns_metrics() {
-    let Some(ctx) = setup_pg().await else {
+    let Some(ctx) = PgTestContext::new_seeded().await else {
         eprintln!("skipping pipeline tests: TEST_DATABASE_URL not set");
         return;
     };
@@ -180,7 +181,7 @@ async fn pipeline_report_returns_metrics() {
     }));
     let resp = ctx
         .schema
-        .execute(Request::new(query).variables(vars))
+        .execute(Request::new(query).variables(vars).data(owner_user(&ctx)))
         .await;
     assert!(resp.errors.is_empty(), "errors: {:?}", resp.errors);
     let report = resp.data.into_json().unwrap()["crm"]["pipelineReport"].clone();
@@ -210,4 +211,5 @@ async fn pipeline_report_returns_metrics() {
     assert!(
         velocity["p90DaysToWin"].as_f64().unwrap() >= velocity["p50DaysToWin"].as_f64().unwrap()
     );
+    ctx.cleanup().await;
 }
