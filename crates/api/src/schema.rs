@@ -1,16 +1,17 @@
-use std::sync::Arc;
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
 use async_graphql::{
     Context, EmptySubscription, Enum, Error, ErrorExtensions, InputObject, Json, Object, Schema,
     SimpleObject, ID,
 };
-use chrono::{DateTime, NaiveDate, Utc};
-use entity::{activity, company, contact, deal, deal_stage_history, task};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use entity::{activity, company, contact, deal, deal_stage_history, stage_meta, task};
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, Func, SimpleExpr};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, DbErr,
-    EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect, Select, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend,
+    DatabaseConnection, DbErr, EntityTrait, FromQueryResult, Order, QueryFilter, QueryOrder,
+    QuerySelect, Select, Statement, TransactionTrait, Value,
 };
 use serde_json::json;
 use tracing::info_span;
@@ -29,6 +30,140 @@ pub struct QueryRoot;
 pub struct MutationRoot;
 
 const MAX_TASKS_PAGE: i32 = 100;
+const MAX_SEARCH_PAGE: i32 = 50;
+const MAX_PIPELINE_PER_STAGE: i32 = 100;
+
+#[derive(Enum, Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CrmSearchKind {
+    #[graphql(name = "COMPANY")]
+    Company,
+    #[graphql(name = "CONTACT")]
+    Contact,
+    #[graphql(name = "DEAL")]
+    Deal,
+}
+
+impl CrmSearchKind {}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct SearchHit {
+    pub kind: CrmSearchKind,
+    pub id: ID,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub score: f64,
+    pub href: Option<String>,
+}
+
+#[derive(Enum, Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TimeGroup {
+    #[graphql(name = "MONTH")]
+    Month,
+    #[graphql(name = "WEEK")]
+    Week,
+}
+
+#[derive(InputObject)]
+pub struct DateRange {
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct PipelineStage {
+    pub key: String,
+    #[graphql(name = "displayName")]
+    pub display_name: String,
+    #[graphql(name = "sortOrder")]
+    pub sort_order: i32,
+    pub probability: i32,
+    #[graphql(name = "isWon")]
+    pub is_won: bool,
+    #[graphql(name = "isLost")]
+    pub is_lost: bool,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct PipelineDeal {
+    pub id: ID,
+    pub title: String,
+    #[graphql(name = "amountCents")]
+    pub amount_cents: Option<i64>,
+    pub currency: Option<String>,
+    #[graphql(name = "stageKey")]
+    pub stage_key: String,
+    #[graphql(name = "companyId")]
+    pub company_id: ID,
+    #[graphql(name = "companyName")]
+    pub company_name: Option<String>,
+    #[graphql(name = "expectedClose")]
+    pub expected_close: Option<NaiveDate>,
+    #[graphql(name = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct PipelineColumn {
+    pub stage: PipelineStage,
+    #[graphql(name = "totalCount")]
+    pub total_count: i32,
+    #[graphql(name = "totalAmountCents")]
+    pub total_amount_cents: Option<i64>,
+    #[graphql(name = "expectedValueCents")]
+    pub expected_value_cents: Option<i64>,
+    pub deals: Vec<PipelineDeal>,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct PipelineBoard {
+    pub columns: Vec<PipelineColumn>,
+    #[graphql(name = "totalCount")]
+    pub total_count: i32,
+    #[graphql(name = "totalAmountCents")]
+    pub total_amount_cents: Option<i64>,
+    #[graphql(name = "totalExpectedCents")]
+    pub total_expected_cents: Option<i64>,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct StageTotals {
+    pub stage: PipelineStage,
+    pub count: i32,
+    #[graphql(name = "amountCents")]
+    pub amount_cents: Option<i64>,
+    #[graphql(name = "expectedCents")]
+    pub expected_cents: Option<i64>,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct ForecastPoint {
+    pub period: String,
+    #[graphql(name = "amountCents")]
+    pub amount_cents: Option<i64>,
+    #[graphql(name = "expectedCents")]
+    pub expected_cents: Option<i64>,
+    pub deals: i32,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct VelocityStats {
+    #[graphql(name = "dealsWon")]
+    pub deals_won: i32,
+    #[graphql(name = "avgDaysToWin")]
+    pub avg_days_to_win: f64,
+    #[graphql(name = "p50DaysToWin")]
+    pub p50_days_to_win: f64,
+    #[graphql(name = "p90DaysToWin")]
+    pub p90_days_to_win: f64,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct PipelineReport {
+    #[graphql(name = "stageTotals")]
+    pub stage_totals: Vec<StageTotals>,
+    pub forecast: Vec<ForecastPoint>,
+    pub velocity: VelocityStats,
+}
 
 #[Object]
 impl QueryRoot {
@@ -52,6 +187,193 @@ pub struct CrmMutation;
 
 #[Object]
 impl CrmQuery {
+    async fn search(
+        &self,
+        ctx: &Context<'_>,
+        q: String,
+        kinds: Option<Vec<CrmSearchKind>>,
+        first: Option<i32>,
+        offset: Option<i32>,
+    ) -> async_graphql::Result<Vec<SearchHit>> {
+        let db = database(ctx)?;
+        let trimmed = validate_search_query(&q)?;
+        let requested = first.unwrap_or(20);
+        let limit = enforce_search_limit(requested, MAX_SEARCH_PAGE)?;
+        let skip = offset.unwrap_or(0).max(0) as u64;
+        let selected_kinds = kinds.unwrap_or_else(default_search_kinds);
+        search_hits(db.as_ref(), trimmed, &selected_kinds, limit, skip).await
+    }
+
+    async fn suggest_companies(
+        &self,
+        ctx: &Context<'_>,
+        q: String,
+        first: Option<i32>,
+    ) -> async_graphql::Result<Vec<CompanyNode>> {
+        let db = database(ctx)?;
+        let trimmed = validate_search_query(&q)?;
+        let requested = first.unwrap_or(10);
+        let limit = enforce_search_limit(requested, MAX_SEARCH_PAGE)?;
+        let hits = search_hits(db.as_ref(), trimmed, &[CrmSearchKind::Company], limit, 0).await?;
+        let ids: Vec<Uuid> = hits
+            .iter()
+            .filter_map(|hit| Uuid::parse_str(hit.id.as_str()).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let records = company::Entity::find()
+            .filter(company::Column::Id.is_in(ids.clone()))
+            .all(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        Ok(order_by_ids(ids, records, |model| model.id)
+            .into_iter()
+            .map(CompanyNode::from)
+            .collect())
+    }
+
+    async fn suggest_contacts(
+        &self,
+        ctx: &Context<'_>,
+        q: String,
+        first: Option<i32>,
+    ) -> async_graphql::Result<Vec<ContactNode>> {
+        let db = database(ctx)?;
+        let trimmed = validate_search_query(&q)?;
+        let requested = first.unwrap_or(10);
+        let limit = enforce_search_limit(requested, MAX_SEARCH_PAGE)?;
+        let hits = search_hits(db.as_ref(), trimmed, &[CrmSearchKind::Contact], limit, 0).await?;
+        let ids: Vec<Uuid> = hits
+            .iter()
+            .filter_map(|hit| Uuid::parse_str(hit.id.as_str()).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let records = contact::Entity::find()
+            .filter(contact::Column::Id.is_in(ids.clone()))
+            .all(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        Ok(order_by_ids(ids, records, |model| model.id)
+            .into_iter()
+            .map(ContactNode::from)
+            .collect())
+    }
+
+    async fn suggest_deals(
+        &self,
+        ctx: &Context<'_>,
+        q: String,
+        first: Option<i32>,
+    ) -> async_graphql::Result<Vec<DealNode>> {
+        let db = database(ctx)?;
+        let trimmed = validate_search_query(&q)?;
+        let requested = first.unwrap_or(10);
+        let limit = enforce_search_limit(requested, MAX_SEARCH_PAGE)?;
+        let hits = search_hits(db.as_ref(), trimmed, &[CrmSearchKind::Deal], limit, 0).await?;
+        let ids: Vec<Uuid> = hits
+            .iter()
+            .filter_map(|hit| Uuid::parse_str(hit.id.as_str()).ok())
+            .collect();
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let records = deal::Entity::find()
+            .filter(deal::Column::Id.is_in(ids.clone()))
+            .all(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        Ok(order_by_ids(ids, records, |model| model.id)
+            .into_iter()
+            .map(DealNode::from)
+            .collect())
+    }
+
+    async fn pipeline_stages(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<PipelineStage>> {
+        let db = database(ctx)?;
+        load_pipeline_stages(db.as_ref()).await
+    }
+
+    async fn pipeline_board(
+        &self,
+        ctx: &Context<'_>,
+        first_per_stage: Option<i32>,
+        stage_keys: Option<Vec<String>>,
+        company_id: Option<ID>,
+        q: Option<String>,
+        order_by_updated: Option<bool>,
+    ) -> async_graphql::Result<PipelineBoard> {
+        let db = database(ctx)?;
+        let first_requested = first_per_stage.unwrap_or(25);
+        let per_stage_limit = enforce_search_limit(first_requested, MAX_PIPELINE_PER_STAGE)?;
+        let company_filter = match company_id {
+            Some(id) => Some(parse_uuid(&id)?),
+            None => None,
+        };
+        let query_filter = q.and_then(|term| {
+            let trimmed = term.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let stage_models = load_stage_meta(db.as_ref()).await?;
+        let selected = filter_stage_meta(stage_models, stage_keys);
+        let span = info_span!(
+            "crm.pipelineBoard",
+            first_per_stage = per_stage_limit,
+            company_id = ?company_filter,
+            stage_keys = ?selected.iter().map(|s| s.key.clone()).collect::<Vec<_>>(),
+            q = ?query_filter,
+            order_by_updated = order_by_updated.unwrap_or(true)
+        );
+        let _guard = span.enter();
+        build_pipeline_board(
+            db.as_ref(),
+            &selected,
+            company_filter,
+            query_filter,
+            per_stage_limit,
+            order_by_updated.unwrap_or(true),
+        )
+        .await
+    }
+
+    async fn pipeline_report(
+        &self,
+        ctx: &Context<'_>,
+        range: DateRange,
+        group: Option<TimeGroup>,
+        include_lost: Option<bool>,
+    ) -> async_graphql::Result<PipelineReport> {
+        let db = database(ctx)?;
+        validate_date_range(&range)?;
+        let grouping = group.unwrap_or(TimeGroup::Month);
+        if grouping != TimeGroup::Month {
+            return Err(error_with_code(
+                "VALIDATION",
+                "Only MONTH grouping is supported",
+            ));
+        }
+        let stage_models = load_stage_meta(db.as_ref()).await?;
+        let include_lost = include_lost.unwrap_or(false);
+        let span = info_span!(
+            "crm.pipelineReport",
+            from = %range.from,
+            to = %range.to,
+            include_lost,
+            group = ?grouping
+        );
+        let _guard = span.enter();
+        build_pipeline_report(db.as_ref(), &stage_models, &range, include_lost).await
+    }
+
     #[graphql(name = "dealStageHistory")]
     async fn deal_stage_history(
         &self,
@@ -218,7 +540,7 @@ impl CrmMutation {
         let deal_id = parse_uuid(&id)?;
         let target_stage: deal::Stage = stage.into();
 
-        let model = move_deal_stage_internal(db.as_ref(), deal_id, target_stage, note, None)
+        let model = move_deal_stage_internal(db.as_ref(), deal_id, target_stage, note, None, None)
             .await
             .map_err(stage_move_error)?;
 
@@ -542,6 +864,65 @@ pub struct UpdateTaskInput {
 }
 
 #[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "Company")]
+pub struct CompanyNode {
+    pub id: ID,
+    pub name: String,
+    pub website: Option<String>,
+    pub phone: Option<String>,
+    #[graphql(name = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[graphql(name = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<company::Model> for CompanyNode {
+    fn from(model: company::Model) -> Self {
+        Self {
+            id: ID::from(model.id.to_string()),
+            name: model.name,
+            website: model.website,
+            phone: model.phone,
+            created_at: model.created_at.into(),
+            updated_at: model.updated_at.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "Contact")]
+pub struct ContactNode {
+    pub id: ID,
+    pub email: String,
+    #[graphql(name = "firstName")]
+    pub first_name: Option<String>,
+    #[graphql(name = "lastName")]
+    pub last_name: Option<String>,
+    pub phone: Option<String>,
+    #[graphql(name = "companyId")]
+    pub company_id: Option<ID>,
+    #[graphql(name = "createdAt")]
+    pub created_at: DateTime<Utc>,
+    #[graphql(name = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<contact::Model> for ContactNode {
+    fn from(model: contact::Model) -> Self {
+        Self {
+            id: ID::from(model.id.to_string()),
+            email: model.email,
+            first_name: model.first_name,
+            last_name: model.last_name,
+            phone: model.phone,
+            company_id: model.company_id.map(|id| ID::from(id.to_string())),
+            created_at: model.created_at.into(),
+            updated_at: model.updated_at.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, SimpleObject)]
 #[graphql(name = "Task")]
 pub struct TaskNode {
     pub id: ID,
@@ -717,6 +1098,7 @@ async fn move_deal_stage_internal(
     stage: deal::Stage,
     note: Option<String>,
     changed_by: Option<String>,
+    timestamp: Option<DateTimeWithTimeZone>,
 ) -> Result<deal::Model, StageMoveError> {
     let txn = db.begin().await?;
     let existing = deal::Entity::find_by_id(deal_id)
@@ -724,7 +1106,7 @@ async fn move_deal_stage_internal(
         .await?
         .ok_or(StageMoveError::NotFound)?;
 
-    let now: DateTimeWithTimeZone = Utc::now().into();
+    let now: DateTimeWithTimeZone = timestamp.unwrap_or_else(|| Utc::now().into());
     if existing.stage == stage {
         let mut active: deal::ActiveModel = existing.into();
         active.updated_at = Set(now.clone());
@@ -819,6 +1201,696 @@ fn error_with_code(code: &'static str, message: impl Into<String>) -> Error {
     Error::new(message).extend_with(|_, e| e.set("code", code))
 }
 
+#[derive(Debug, Clone)]
+pub struct SeededCrmRecords {
+    pub companies: Vec<company::Model>,
+    pub contacts: Vec<contact::Model>,
+    pub deals: Vec<deal::Model>,
+}
+
+impl SeededCrmRecords {
+    pub fn company_named(&self, name: &str) -> Option<&company::Model> {
+        self.companies.iter().find(|c| c.name == name)
+    }
+
+    pub fn contact_email(&self, email: &str) -> Option<&contact::Model> {
+        self.contacts.iter().find(|c| c.email == email)
+    }
+
+    pub fn deal_titled(&self, title: &str) -> Option<&deal::Model> {
+        self.deals.iter().find(|d| d.title == title)
+    }
+}
+
+pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, DbErr> {
+    let base_date = NaiveDate::from_ymd_opt(2025, 1, 15).unwrap();
+    let base_time = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
+    let base_dt: DateTime<Utc> =
+        DateTime::from_naive_utc_and_offset(NaiveDateTime::new(base_date, base_time), Utc);
+    let base_ts: DateTimeWithTimeZone = base_dt.into();
+
+    let acme = company::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set("ACME, Inc.".into()),
+        website: Set(Some("https://acme.test".into())),
+        phone: Set(Some("+1-555-0100".into())),
+        created_at: Set(base_ts),
+        updated_at: Set(base_ts),
+    }
+    .insert(db)
+    .await?;
+
+    let fossrust = company::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set("FossRust Labs".into()),
+        website: Set(Some("https://fossrust.test".into())),
+        phone: Set(Some("+1-555-0300".into())),
+        created_at: Set(base_ts),
+        updated_at: Set(base_ts),
+    }
+    .insert(db)
+    .await?;
+
+    let nuflights = company::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set("NuFlights LLC".into()),
+        website: Set(Some("https://nuflights.test".into())),
+        phone: Set(Some("+1-555-0200".into())),
+        created_at: Set(base_ts),
+        updated_at: Set(base_ts),
+    }
+    .insert(db)
+    .await?;
+
+    let ada = contact::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        email: Set("ada@acme.test".into()),
+        first_name: Set(Some("Ada".into())),
+        last_name: Set(Some("Lovelace".into())),
+        phone: Set(Some("+1-555-0110".into())),
+        company_id: Set(Some(acme.id)),
+        created_at: Set(base_ts),
+        updated_at: Set(base_ts),
+    }
+    .insert(db)
+    .await?;
+
+    let charles = contact::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        email: Set("charles@acme.test".into()),
+        first_name: Set(Some("Charles".into())),
+        last_name: Set(Some("Babbage".into())),
+        phone: Set(Some("+1-555-0111".into())),
+        company_id: Set(Some(acme.id)),
+        created_at: Set(base_ts),
+        updated_at: Set(base_ts),
+    }
+    .insert(db)
+    .await?;
+
+    let linus = contact::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        email: Set("linus@fossrust.test".into()),
+        first_name: Set(Some("Linus".into())),
+        last_name: Set(Some("Torvalds".into())),
+        phone: Set(Some("+1-555-0310".into())),
+        company_id: Set(Some(fossrust.id)),
+        created_at: Set(base_ts),
+        updated_at: Set(base_ts),
+    }
+    .insert(db)
+    .await?;
+
+    let grace = contact::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        email: Set("grace@nuflights.test".into()),
+        first_name: Set(Some("Grace".into())),
+        last_name: Set(Some("Hopper".into())),
+        phone: Set(Some("+1-555-0210".into())),
+        company_id: Set(Some(nuflights.id)),
+        created_at: Set(base_ts),
+        updated_at: Set(base_ts),
+    }
+    .insert(db)
+    .await?;
+
+    let acme_pilot_created = base_dt - Duration::days(10);
+    let acme_pilot = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("ACME Pilot".into()),
+        amount_cents: Set(Some(120_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::New),
+        close_date: Set(Some((base_date + Duration::days(15)).into())),
+        company_id: Set(acme.id),
+        created_at: Set(acme_pilot_created.into()),
+        updated_at: Set(acme_pilot_created.into()),
+    }
+    .insert(db)
+    .await?;
+
+    let tooling_created = base_dt - Duration::days(20);
+    let tooling = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("Rust Tooling Upgrade".into()),
+        amount_cents: Set(Some(75_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::Proposal),
+        close_date: Set(Some((base_date + Duration::days(45)).into())),
+        company_id: Set(fossrust.id),
+        created_at: Set(tooling_created.into()),
+        updated_at: Set(tooling_created.into()),
+    }
+    .insert(db)
+    .await?;
+
+    let renewal_created = base_dt - Duration::days(15);
+    let renewal = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("NuFlights Annual".into()),
+        amount_cents: Set(Some(210_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::Qualify),
+        close_date: Set(Some((base_date + Duration::days(60)).into())),
+        company_id: Set(nuflights.id),
+        created_at: Set(renewal_created.into()),
+        updated_at: Set(renewal_created.into()),
+    }
+    .insert(db)
+    .await?;
+
+    let expansion_created = base_dt - Duration::days(30);
+    let expansion = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("ACME Expansion".into()),
+        amount_cents: Set(Some(150_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::New),
+        close_date: Set(Some((base_date + Duration::days(5)).into())),
+        company_id: Set(acme.id),
+        created_at: Set(expansion_created.into()),
+        updated_at: Set(expansion_created.into()),
+    }
+    .insert(db)
+    .await?;
+
+    let support_created = base_dt - Duration::days(25);
+    let support = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("FossRust Support".into()),
+        amount_cents: Set(Some(50_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::New),
+        close_date: Set(Some((base_date + Duration::days(8)).into())),
+        company_id: Set(fossrust.id),
+        created_at: Set(support_created.into()),
+        updated_at: Set(support_created.into()),
+    }
+    .insert(db)
+    .await?;
+
+    let qualify_time: DateTimeWithTimeZone = (base_dt - Duration::days(5)).into();
+    move_deal_stage_at(
+        db,
+        acme_pilot.id,
+        deal::Stage::Qualify,
+        Some("Qualified via discovery".into()),
+        Some("seed".into()),
+        qualify_time,
+    )
+    .await
+    .map_err(|err| DbErr::Custom(format!("seed stage change failed: {:?}", err)))?;
+    let proposal_time: DateTimeWithTimeZone = (base_dt - Duration::days(2)).into();
+    move_deal_stage_at(
+        db,
+        acme_pilot.id,
+        deal::Stage::Proposal,
+        Some("Proposal shared".into()),
+        Some("seed".into()),
+        proposal_time,
+    )
+    .await
+    .map_err(|err| DbErr::Custom(format!("seed stage change failed: {:?}", err)))?;
+    let negotiate_time: DateTimeWithTimeZone = (base_dt - Duration::days(1)).into();
+    move_deal_stage_at(
+        db,
+        acme_pilot.id,
+        deal::Stage::Negotiate,
+        Some("Negotiating terms".into()),
+        Some("seed".into()),
+        negotiate_time,
+    )
+    .await
+    .map_err(|err| DbErr::Custom(format!("seed stage change failed: {:?}", err)))?;
+
+    let won_time: DateTimeWithTimeZone = (base_dt - Duration::days(2)).into();
+    move_deal_stage_at(
+        db,
+        expansion.id,
+        deal::Stage::Qualify,
+        Some("Expansion scoped".into()),
+        Some("seed".into()),
+        base_dt.into(),
+    )
+    .await
+    .map_err(|err| DbErr::Custom(format!("seed stage change failed: {:?}", err)))?;
+    move_deal_stage_at(
+        db,
+        expansion.id,
+        deal::Stage::Won,
+        Some("Approved".into()),
+        Some("seed".into()),
+        won_time,
+    )
+    .await
+    .map_err(|err| DbErr::Custom(format!("seed stage change failed: {:?}", err)))?;
+
+    let lost_time: DateTimeWithTimeZone = (base_dt - Duration::days(3)).into();
+    move_deal_stage_at(
+        db,
+        support.id,
+        deal::Stage::Lost,
+        Some("Chose competitor".into()),
+        Some("seed".into()),
+        lost_time,
+    )
+    .await
+    .map_err(|err| DbErr::Custom(format!("seed stage change failed: {:?}", err)))?;
+
+    Ok(SeededCrmRecords {
+        companies: vec![acme, fossrust, nuflights],
+        contacts: vec![ada, charles, linus, grace],
+        deals: vec![acme_pilot, tooling, renewal, expansion, support],
+    })
+}
+
+fn pipeline_stage_from_model(model: &stage_meta::Model) -> PipelineStage {
+    PipelineStage {
+        key: model.key.clone(),
+        display_name: model.display_name.clone(),
+        sort_order: model.sort_order as i32,
+        probability: model.probability as i32,
+        is_won: model.is_won,
+        is_lost: model.is_lost,
+    }
+}
+
+async fn load_pipeline_stages(
+    db: &DatabaseConnection,
+) -> async_graphql::Result<Vec<PipelineStage>> {
+    let metas = load_stage_meta(db).await?;
+    Ok(metas.iter().map(pipeline_stage_from_model).collect())
+}
+
+async fn load_stage_meta(db: &DatabaseConnection) -> async_graphql::Result<Vec<stage_meta::Model>> {
+    stage_meta::Entity::find()
+        .order_by_asc(stage_meta::Column::SortOrder)
+        .all(db)
+        .await
+        .map_err(db_error)
+}
+
+fn filter_stage_meta(
+    stages: Vec<stage_meta::Model>,
+    requested_keys: Option<Vec<String>>,
+) -> Vec<stage_meta::Model> {
+    if let Some(keys) = requested_keys {
+        let set: HashSet<String> = keys.iter().cloned().collect();
+        stages
+            .into_iter()
+            .filter(|s| set.contains(&s.key))
+            .collect()
+    } else {
+        stages
+    }
+}
+
+#[derive(Debug, FromQueryResult)]
+struct StageAggregateRow {
+    stage_key: String,
+    total_count: i64,
+    total_amount: Option<i64>,
+    total_expected: Option<i64>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct PipelineDealRow {
+    id: Uuid,
+    title: String,
+    amount_cents: Option<i64>,
+    currency: Option<String>,
+    stage_key: String,
+    company_id: Uuid,
+    company_name: Option<String>,
+    close_date: Option<NaiveDate>,
+    updated_at: DateTimeWithTimeZone,
+}
+
+impl From<PipelineDealRow> for PipelineDeal {
+    fn from(row: PipelineDealRow) -> Self {
+        PipelineDeal {
+            id: ID::from(row.id.to_string()),
+            title: row.title,
+            amount_cents: row.amount_cents,
+            currency: row.currency,
+            stage_key: row.stage_key,
+            company_id: ID::from(row.company_id.to_string()),
+            company_name: row.company_name,
+            expected_close: row.close_date,
+            updated_at: row.updated_at.into(),
+        }
+    }
+}
+
+fn build_deal_filters(
+    company_id: Option<Uuid>,
+    q: Option<&str>,
+    stage_keys: Option<&[String]>,
+    exclude_lost_alias: Option<&str>,
+) -> (String, Vec<Value>) {
+    let mut conditions: Vec<String> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    if let Some(alias) = exclude_lost_alias {
+        conditions.push(format!("{alias}.is_lost = false"));
+    }
+    if let Some(id) = company_id {
+        conditions.push("d.company_id = ?".to_string());
+        values.push(id.into());
+    }
+    if let Some(term) = q {
+        conditions.push("d.title ILIKE ?".to_string());
+        values.push(format!("%{}%", term).into());
+    }
+    if let Some(keys) = stage_keys {
+        if !keys.is_empty() {
+            let placeholders = (0..keys.len())
+                .map(|_| "?".to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            conditions.push(format!("d.stage::text IN ({})", placeholders));
+            values.extend(keys.iter().cloned().map(Value::from));
+        }
+    }
+    let clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+    (clause, values)
+}
+
+async fn build_pipeline_board(
+    db: &DatabaseConnection,
+    stages: &[stage_meta::Model],
+    company_id: Option<Uuid>,
+    q: Option<String>,
+    per_stage_limit: u64,
+    order_by_updated: bool,
+) -> async_graphql::Result<PipelineBoard> {
+    if stages.is_empty() {
+        return Ok(PipelineBoard {
+            columns: vec![],
+            total_count: 0,
+            total_amount_cents: None,
+            total_expected_cents: None,
+        });
+    }
+
+    let stage_keys: Vec<String> = stages.iter().map(|s| s.key.clone()).collect();
+    let (where_clause, values) =
+        build_deal_filters(company_id, q.as_deref(), Some(&stage_keys), None);
+    let totals_sql = format!(
+        "SELECT d.stage::text AS stage_key, COUNT(*) AS total_count,\
+         COALESCE(SUM(d.amount_cents), 0) AS total_amount,\
+         COALESCE(SUM((COALESCE(d.amount_cents, 0) * sm.probability)::bigint / 100), 0) AS total_expected\
+         FROM deal d\
+         JOIN stage_meta sm ON sm.key = d.stage::text\
+         {}\
+         GROUP BY d.stage, sm.probability",
+        where_clause
+    );
+    let totals_stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, totals_sql, values);
+    let totals_rows = StageAggregateRow::find_by_statement(totals_stmt)
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    let totals_map: HashMap<String, StageAggregateRow> = totals_rows
+        .into_iter()
+        .map(|row| (row.stage_key.clone(), row))
+        .collect();
+
+    let mut stage_deals: HashMap<String, Vec<PipelineDeal>> = HashMap::new();
+    for stage in stages {
+        let mut conditions = vec!["d.stage::text = ?".to_string()];
+        let mut stage_values: Vec<Value> = vec![stage.key.clone().into()];
+        if let Some(id) = company_id {
+            conditions.push("d.company_id = ?".to_string());
+            stage_values.push(id.into());
+        }
+        if let Some(term) = q.as_deref() {
+            conditions.push("d.title ILIKE ?".to_string());
+            stage_values.push(format!("%{}%", term).into());
+        }
+        let clause = format!("WHERE {}", conditions.join(" AND "));
+        let order_clause = if order_by_updated {
+            "d.updated_at DESC"
+        } else {
+            "d.created_at DESC"
+        };
+        let deals_sql = format!(
+            "SELECT d.id, d.title, d.amount_cents, d.currency, d.stage::text AS stage_key, d.company_id,\
+             c.name AS company_name, d.close_date, d.updated_at\
+             FROM deal d\
+             JOIN company c ON c.id = d.company_id\
+             {}\
+             ORDER BY {}\
+             LIMIT {}",
+            clause, order_clause, per_stage_limit
+        );
+        let stmt =
+            Statement::from_sql_and_values(DatabaseBackend::Postgres, deals_sql, stage_values);
+        let rows = PipelineDealRow::find_by_statement(stmt)
+            .all(db)
+            .await
+            .map_err(db_error)?;
+        stage_deals.insert(
+            stage.key.clone(),
+            rows.into_iter().map(PipelineDeal::from).collect(),
+        );
+    }
+
+    let mut board_total_count: i64 = 0;
+    let mut board_total_amount: Option<i64> = None;
+    let mut board_total_expected: Option<i64> = None;
+    let mut columns: Vec<PipelineColumn> = Vec::new();
+    for stage in stages {
+        let totals = totals_map.get(&stage.key);
+        let total_count = totals.map(|t| t.total_count as i32).unwrap_or(0);
+        let total_amount = totals.and_then(|t| t.total_amount);
+        let total_expected = totals.and_then(|t| t.total_expected);
+        board_total_count += total_count as i64;
+        board_total_amount = add_optional_sum(board_total_amount, total_amount);
+        board_total_expected = add_optional_sum(board_total_expected, total_expected);
+        let deals = stage_deals.remove(&stage.key).unwrap_or_default();
+        columns.push(PipelineColumn {
+            stage: pipeline_stage_from_model(stage),
+            total_count,
+            total_amount_cents: total_amount,
+            expected_value_cents: total_expected,
+            deals,
+        });
+    }
+
+    Ok(PipelineBoard {
+        columns,
+        total_count: board_total_count as i32,
+        total_amount_cents: board_total_amount,
+        total_expected_cents: board_total_expected,
+    })
+}
+
+#[derive(Debug, FromQueryResult)]
+struct ForecastRow {
+    period: String,
+    amount_cents: Option<i64>,
+    expected_cents: Option<i64>,
+    deals: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct VelocityRow {
+    days_to_win: f64,
+}
+
+fn report_filters(range: &DateRange, include_lost: bool) -> (String, Vec<Value>) {
+    let mut conditions = vec![
+        "COALESCE(d.close_date, d.created_at::date) >= ?".to_string(),
+        "COALESCE(d.close_date, d.created_at::date) <= ?".to_string(),
+    ];
+    let values: Vec<Value> = vec![range.from.into(), range.to.into()];
+    if !include_lost {
+        conditions.push("sm.is_lost = false".to_string());
+    }
+    (format!("WHERE {}", conditions.join(" AND ")), values)
+}
+
+fn forecast_filters(range: &DateRange, include_lost: bool) -> (String, Vec<Value>) {
+    let (mut clause, mut values) = report_filters(range, include_lost);
+    clause.push_str(
+        " AND date_trunc('month', COALESCE(d.close_date, d.created_at::date)) \
+         BETWEEN date_trunc('month', ?::date) AND date_trunc('month', ?::date)",
+    );
+    values.push(range.from.into());
+    values.push(range.to.into());
+    (clause, values)
+}
+
+async fn build_pipeline_report(
+    db: &DatabaseConnection,
+    stages: &[stage_meta::Model],
+    range: &DateRange,
+    include_lost: bool,
+) -> async_graphql::Result<PipelineReport> {
+    let filtered_stages: Vec<&stage_meta::Model> = stages
+        .iter()
+        .filter(|s| include_lost || !s.is_lost)
+        .collect();
+
+    let (stage_clause, stage_values) = report_filters(range, include_lost);
+    let totals_sql = format!(
+        "SELECT d.stage::text AS stage_key, COUNT(*) AS total_count,\
+         COALESCE(SUM(d.amount_cents), 0) AS total_amount,\
+         COALESCE(SUM((COALESCE(d.amount_cents, 0) * sm.probability)::bigint / 100), 0) AS total_expected\
+         FROM deal d\
+         JOIN stage_meta sm ON sm.key = d.stage::text\
+         {}\
+         GROUP BY d.stage, sm.probability",
+        stage_clause
+    );
+    let totals_stmt =
+        Statement::from_sql_and_values(DatabaseBackend::Postgres, totals_sql, stage_values);
+    let totals_rows = StageAggregateRow::find_by_statement(totals_stmt)
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    let totals_map: HashMap<String, StageAggregateRow> = totals_rows
+        .into_iter()
+        .map(|row| (row.stage_key.clone(), row))
+        .collect();
+
+    let stage_totals: Vec<StageTotals> = filtered_stages
+        .iter()
+        .map(|stage| {
+            let totals = totals_map.get(&stage.key);
+            StageTotals {
+                stage: pipeline_stage_from_model(stage),
+                count: totals.map(|t| t.total_count as i32).unwrap_or(0),
+                amount_cents: totals.and_then(|t| t.total_amount),
+                expected_cents: totals.and_then(|t| t.total_expected),
+            }
+        })
+        .collect();
+
+    let (forecast_clause, forecast_values) = forecast_filters(range, include_lost);
+    let forecast_sql = format!(
+        "SELECT to_char(date_trunc('month', COALESCE(d.close_date, d.created_at::date)), 'YYYY-MM') AS period,\
+         COALESCE(SUM(d.amount_cents), 0) AS amount_cents,\
+         COALESCE(SUM((COALESCE(d.amount_cents, 0) * sm.probability)::bigint / 100), 0) AS expected_cents,\
+         COUNT(*) AS deals\
+         FROM deal d\
+         JOIN stage_meta sm ON sm.key = d.stage::text\
+         {}\
+         GROUP BY period\
+         ORDER BY period",
+        forecast_clause
+    );
+    let forecast_stmt =
+        Statement::from_sql_and_values(DatabaseBackend::Postgres, forecast_sql, forecast_values);
+    let forecast_rows = ForecastRow::find_by_statement(forecast_stmt)
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    let forecast_map: HashMap<String, ForecastRow> = forecast_rows
+        .into_iter()
+        .map(|row| (row.period.clone(), row))
+        .collect();
+    let months = enumerate_months(range);
+    let forecast: Vec<ForecastPoint> = months
+        .into_iter()
+        .map(|period| {
+            if let Some(row) = forecast_map.get(&period) {
+                ForecastPoint {
+                    period: period.clone(),
+                    amount_cents: row.amount_cents,
+                    expected_cents: row.expected_cents,
+                    deals: row.deals as i32,
+                }
+            } else {
+                ForecastPoint {
+                    period: period.clone(),
+                    amount_cents: Some(0),
+                    expected_cents: Some(0),
+                    deals: 0,
+                }
+            }
+        })
+        .collect();
+
+    let velocity = velocity_stats(db, range).await?;
+
+    Ok(PipelineReport {
+        stage_totals,
+        forecast,
+        velocity,
+    })
+}
+
+fn enumerate_months(range: &DateRange) -> Vec<String> {
+    let mut months = Vec::new();
+    let mut current =
+        NaiveDate::from_ymd_opt(range.from.year(), range.from.month(), 1).unwrap_or(range.from);
+    let end = NaiveDate::from_ymd_opt(range.to.year(), range.to.month(), 1).unwrap_or(range.to);
+    while current <= end {
+        months.push(current.format("%Y-%m").to_string());
+        let next_month = if current.month() == 12 {
+            NaiveDate::from_ymd_opt(current.year() + 1, 1, 1).unwrap()
+        } else {
+            NaiveDate::from_ymd_opt(current.year(), current.month() + 1, 1).unwrap()
+        };
+        current = next_month;
+    }
+    months
+}
+
+async fn velocity_stats(
+    db: &DatabaseConnection,
+    range: &DateRange,
+) -> async_graphql::Result<VelocityStats> {
+    let velocity_sql =
+        "SELECT EXTRACT(EPOCH FROM (MIN(h.changed_at) - d.created_at)) / 86400.0 AS days_to_win\
+        FROM deal d\
+        JOIN deal_stage_history h ON h.deal_id = d.id AND h.to_stage = 'WON'::deal_stage\
+        WHERE h.changed_at::date >= ? AND h.changed_at::date <= ?\
+        GROUP BY d.id";
+    let stmt = Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        velocity_sql,
+        vec![range.from.into(), range.to.into()],
+    );
+    let rows = VelocityRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    let mut values: Vec<f64> = rows.into_iter().map(|row| row.days_to_win).collect();
+    if values.is_empty() {
+        return Ok(VelocityStats {
+            deals_won: 0,
+            avg_days_to_win: 0.0,
+            p50_days_to_win: 0.0,
+            p90_days_to_win: 0.0,
+        });
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let sum: f64 = values.iter().sum();
+    let avg = sum / values.len() as f64;
+    let p50 = percentile(&values, 0.5);
+    let p90 = percentile(&values, 0.9);
+    Ok(VelocityStats {
+        deals_won: values.len() as i32,
+        avg_days_to_win: avg,
+        p50_days_to_win: p50,
+        p90_days_to_win: p90,
+    })
+}
+
+fn percentile(values: &[f64], frac: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let idx = ((values.len() as f64 - 1.0) * frac).round() as usize;
+    values.get(idx).copied().unwrap_or(0.0)
+}
+
 /// Exposed for seeders/tests to drive the same transactional logic.
 pub async fn move_deal_stage_service(
     db: &DatabaseConnection,
@@ -827,7 +1899,18 @@ pub async fn move_deal_stage_service(
     note: Option<String>,
     changed_by: Option<String>,
 ) -> Result<deal::Model, StageMoveError> {
-    move_deal_stage_internal(db, deal_id, stage, note, changed_by).await
+    move_deal_stage_internal(db, deal_id, stage, note, changed_by, None).await
+}
+
+pub async fn move_deal_stage_at(
+    db: &DatabaseConnection,
+    deal_id: Uuid,
+    stage: deal::Stage,
+    note: Option<String>,
+    changed_by: Option<String>,
+    changed_at: DateTimeWithTimeZone,
+) -> Result<deal::Model, StageMoveError> {
+    move_deal_stage_internal(db, deal_id, stage, note, changed_by, Some(changed_at)).await
 }
 
 async fn create_task_internal(
@@ -917,6 +2000,301 @@ async fn transition_task_status(
     active.updated_at = Set(Utc::now().into());
     let updated = active.update(db).await.map_err(db_error)?;
     Ok(updated)
+}
+
+fn default_search_kinds() -> Vec<CrmSearchKind> {
+    vec![
+        CrmSearchKind::Company,
+        CrmSearchKind::Contact,
+        CrmSearchKind::Deal,
+    ]
+}
+
+fn validate_search_query(q: &str) -> async_graphql::Result<&str> {
+    let trimmed = q.trim();
+    if trimmed.is_empty() {
+        return Err(error_with_code(
+            "VALIDATION",
+            "Search query cannot be empty",
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn enforce_search_limit(requested: i32, max: i32) -> async_graphql::Result<u64> {
+    if requested > max {
+        return Err(error_with_code(
+            "LIMIT_EXCEEDED",
+            format!("first cannot exceed {}", max),
+        ));
+    }
+    Ok(requested.max(0) as u64)
+}
+
+fn validate_date_range(range: &DateRange) -> async_graphql::Result<()> {
+    if range.from > range.to {
+        return Err(error_with_code(
+            "VALIDATION",
+            "range.from must be before or equal to range.to",
+        ));
+    }
+    Ok(())
+}
+
+fn add_optional_sum(current: Option<i64>, value: Option<i64>) -> Option<i64> {
+    value.map(|val| current.unwrap_or(0) + val).or(current)
+}
+
+fn order_by_ids<T, K, F>(ids: Vec<K>, records: Vec<T>, key: F) -> Vec<T>
+where
+    K: Eq + std::hash::Hash + Copy,
+    T: Clone,
+    F: Fn(&T) -> K,
+{
+    let mut map = HashMap::new();
+    for record in records {
+        map.insert(key(&record), record);
+    }
+    ids.into_iter()
+        .filter_map(|id| map.get(&id).cloned())
+        .collect()
+}
+
+#[derive(Debug, FromQueryResult)]
+struct SearchHitRow {
+    kind: String,
+    id: Uuid,
+    title: String,
+    subtitle: Option<String>,
+    score: f64,
+    href: Option<String>,
+}
+
+impl TryFrom<SearchHitRow> for SearchHit {
+    type Error = Error;
+
+    fn try_from(row: SearchHitRow) -> Result<Self, Self::Error> {
+        let kind = match row.kind.as_str() {
+            "COMPANY" => CrmSearchKind::Company,
+            "CONTACT" => CrmSearchKind::Contact,
+            "DEAL" => CrmSearchKind::Deal,
+            _ => return Err(error_with_code("INTERNAL", "Unknown search kind")),
+        };
+        Ok(SearchHit {
+            kind,
+            id: ID::from(row.id.to_string()),
+            title: row.title,
+            subtitle: row.subtitle,
+            score: row.score,
+            href: row.href,
+        })
+    }
+}
+
+async fn search_hits(
+    db: &DatabaseConnection,
+    q: &str,
+    kinds: &[CrmSearchKind],
+    limit: u64,
+    offset: u64,
+) -> async_graphql::Result<Vec<SearchHit>> {
+    let allow_company = kinds.iter().any(|k| *k == CrmSearchKind::Company);
+    let allow_contact = kinds.iter().any(|k| *k == CrmSearchKind::Contact);
+    let allow_deal = kinds.iter().any(|k| *k == CrmSearchKind::Deal);
+    if !allow_company && !allow_contact && !allow_deal {
+        return Ok(vec![]);
+    }
+    let use_fts = q.len() >= 2 && has_tsquery_terms(db, q).await?;
+    if use_fts {
+        run_fts_search(
+            db,
+            q,
+            allow_company,
+            allow_contact,
+            allow_deal,
+            limit,
+            offset,
+        )
+        .await
+    } else {
+        run_trgm_search(
+            db,
+            q,
+            allow_company,
+            allow_contact,
+            allow_deal,
+            limit,
+            offset,
+        )
+        .await
+    }
+}
+
+async fn has_tsquery_terms(db: &DatabaseConnection, q: &str) -> async_graphql::Result<bool> {
+    let stmt = Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT length(websearch_to_tsquery('simple', $1)::text) > 0 AS has_terms",
+        vec![q.to_owned().into()],
+    );
+    let row = db.query_one(stmt).await.map_err(db_error)?;
+    Ok(row
+        .and_then(|r| r.try_get("", "has_terms").ok())
+        .unwrap_or(false))
+}
+
+async fn run_fts_search(
+    db: &DatabaseConnection,
+    q: &str,
+    allow_company: bool,
+    allow_contact: bool,
+    allow_deal: bool,
+    limit: u64,
+    offset: u64,
+) -> async_graphql::Result<Vec<SearchHit>> {
+    let mut selects: Vec<String> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    if allow_company {
+        selects.push(
+            "SELECT 'COMPANY' AS kind, id, name AS title, website AS subtitle,\
+             LEAST(1.0, ts_rank_cd(tsv, websearch_to_tsquery('simple', ?), ARRAY[1.0,0.4,0.2,0.1])) AS score,\
+             '/crm/company/' || id::text AS href\
+             FROM company\
+             WHERE tsv @@ websearch_to_tsquery('simple', ?)"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+    }
+    if allow_contact {
+        selects.push(
+            "SELECT 'CONTACT' AS kind, contact.id,\
+             COALESCE(NULLIF(trim(coalesce(contact.first_name, '') || ' ' || coalesce(contact.last_name, '')), ''), contact.email) AS title,\
+             companies.name AS subtitle,\
+             LEAST(1.0, ts_rank_cd(contact.tsv, websearch_to_tsquery('simple', ?), ARRAY[1.0,0.4,0.2,0.1])) AS score,\
+             '/crm/contact/' || contact.id::text AS href\
+             FROM contact\
+             LEFT JOIN company AS companies ON companies.id = contact.company_id\
+             WHERE contact.tsv @@ websearch_to_tsquery('simple', ?)"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+    }
+    if allow_deal {
+        selects.push(
+            "SELECT 'DEAL' AS kind, deal.id, deal.title AS title, companies.name AS subtitle,\
+             LEAST(1.0, ts_rank_cd(deal.tsv, websearch_to_tsquery('simple', ?), ARRAY[1.0,0.4,0.2,0.1])) AS score,\
+             '/crm/deal/' || deal.id::text AS href\
+             FROM deal\
+             LEFT JOIN company AS companies ON companies.id = deal.company_id\
+             WHERE deal.tsv @@ websearch_to_tsquery('simple', ?)"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+    }
+    if selects.is_empty() {
+        return Ok(vec![]);
+    }
+    let sql = format!(
+        "{} ORDER BY score DESC, title ASC LIMIT {} OFFSET {}",
+        selects.join(" UNION ALL "),
+        limit,
+        offset
+    );
+    let stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values);
+    let rows = SearchHitRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| SearchHit::try_from(row).ok())
+        .collect())
+}
+
+async fn run_trgm_search(
+    db: &DatabaseConnection,
+    q: &str,
+    allow_company: bool,
+    allow_contact: bool,
+    allow_deal: bool,
+    limit: u64,
+    offset: u64,
+) -> async_graphql::Result<Vec<SearchHit>> {
+    let mut selects: Vec<String> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    let pattern = format!("%{}%", q);
+    if allow_company {
+        selects.push(
+            "SELECT 'COMPANY' AS kind, id, name AS title, website AS subtitle,\
+             LEAST(1.0, GREATEST(similarity(name, ?), similarity(coalesce(website, ''), ?))) AS score,\
+             '/crm/company/' || id::text AS href\
+             FROM company\
+             WHERE name % ? OR name ILIKE ? OR website ILIKE ?"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(pattern.clone().into());
+        values.push(pattern.clone().into());
+    }
+    if allow_contact {
+        selects.push(
+            "SELECT 'CONTACT' AS kind, contact.id,\
+             COALESCE(NULLIF(trim(coalesce(contact.first_name, '') || ' ' || coalesce(contact.last_name, '')), ''), contact.email) AS title,\
+             companies.name AS subtitle,\
+             LEAST(1.0, GREATEST(similarity(contact.email, ?), similarity(coalesce(contact.first_name, ''), ?), similarity(coalesce(contact.last_name, ''), ?))) AS score,\
+             '/crm/contact/' || contact.id::text AS href\
+             FROM contact\
+             LEFT JOIN company AS companies ON companies.id = contact.company_id\
+             WHERE contact.email % ? OR contact.first_name % ? OR contact.last_name % ?\
+             OR contact.email ILIKE ? OR contact.first_name ILIKE ? OR contact.last_name ILIKE ?"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(pattern.clone().into());
+        values.push(pattern.clone().into());
+        values.push(pattern.clone().into());
+    }
+    if allow_deal {
+        selects.push(
+            "SELECT 'DEAL' AS kind, deal.id, deal.title AS title, companies.name AS subtitle,\
+             LEAST(1.0, similarity(deal.title, ?)) AS score,\
+             '/crm/deal/' || deal.id::text AS href\
+             FROM deal\
+             LEFT JOIN company AS companies ON companies.id = deal.company_id\
+             WHERE deal.title % ? OR deal.title ILIKE ?"
+                .to_string(),
+        );
+        values.push(q.to_owned().into());
+        values.push(q.to_owned().into());
+        values.push(pattern.clone().into());
+    }
+    if selects.is_empty() {
+        return Ok(vec![]);
+    }
+    let sql = format!(
+        "{} ORDER BY score DESC, title ASC LIMIT {} OFFSET {}",
+        selects.join(" UNION ALL "),
+        limit,
+        offset
+    );
+    let stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values);
+    let rows = SearchHitRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| SearchHit::try_from(row).ok())
+        .collect())
 }
 
 fn validate_task_title(value: &str) -> async_graphql::Result<String> {
