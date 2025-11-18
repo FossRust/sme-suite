@@ -1,10 +1,21 @@
 use api::{
-    auth::{CurrentUser, UserRole},
+    auth::{
+        build_session_cookie, decode_session_token, issue_session_token, AuthConfig, AuthMode,
+        CurrentUser, UserRole, SESSION_COOKIE,
+    },
     schema::{build_schema, AppSchema},
 };
 use async_graphql::{http::GraphiQLSource, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::{extract::State, routing::get, Router};
+use axum::{
+    body::Body,
+    extract::{Extension, State},
+    http::{HeaderMap, Request as AxumRequest},
+    middleware::{from_fn_with_state, Next},
+    response::Response,
+    routing::get,
+    Router,
+};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use dotenvy::dotenv;
@@ -49,9 +60,9 @@ enum Cmd {
 struct AppState {
     schema:
         Schema<api::schema::QueryRoot, api::schema::MutationRoot, async_graphql::EmptySubscription>,
-    #[allow(dead_code)]
     db: Arc<DatabaseConnection>,
-    current_user: CurrentUser,
+    auth: Arc<AuthConfig>,
+    dev_user: Option<CurrentUser>,
 }
 
 #[tokio::main]
@@ -70,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         Err(_) => "postgres://sme_suite:sme_suite@localhost:5432/sme_suite".to_string(),
     };
     let db = Arc::new(Database::connect(&db_url).await?);
+    let auth_config = Arc::new(load_auth_config_from_env()?);
 
     match cli.cmd {
         Cmd::Migrate { action } => {
@@ -86,18 +98,23 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::PrintSchema => {
-            let AppSchema(schema) = build_schema(db.clone());
+            let AppSchema(schema) = build_schema(db.clone(), auth_config.clone());
             println!("{}", schema.sdl());
             Ok(())
         }
         Cmd::Serve { bind } => {
             Migrator::up(db.as_ref(), None).await?;
-            let AppSchema(schema) = build_schema(db.clone());
-            let current_user = load_default_user(db.as_ref()).await?;
+            let AppSchema(schema) = build_schema(db.clone(), auth_config.clone());
+            let dev_user = if auth_config.mode == AuthMode::Disabled {
+                load_default_user(db.as_ref()).await?
+            } else {
+                None
+            };
             let state = AppState {
                 schema,
                 db: db.clone(),
-                current_user,
+                auth: auth_config.clone(),
+                dev_user,
             };
             let app = app_router(state);
 
@@ -116,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn app_router(state: AppState) -> Router {
+    let middleware_state = state.clone();
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/graphiql", get(graphiql))
@@ -128,45 +146,48 @@ fn app_router(state: AppState) -> Router {
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
+        .layer(from_fn_with_state(middleware_state, auth_middleware))
         .with_state(state)
 }
 
-async fn graphql_get(State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
-    execute_graphql(state, req).await
+async fn graphql_get(
+    State(state): State<AppState>,
+    current_user: Option<Extension<CurrentUser>>,
+    req: GraphQLRequest,
+) -> GraphQLResponse {
+    execute_graphql(state, current_user, req).await
 }
 
-async fn graphql_post(State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
-    execute_graphql(state, req).await
+async fn graphql_post(
+    State(state): State<AppState>,
+    current_user: Option<Extension<CurrentUser>>,
+    req: GraphQLRequest,
+) -> GraphQLResponse {
+    execute_graphql(state, current_user, req).await
 }
 
-async fn execute_graphql(state: AppState, req: GraphQLRequest) -> GraphQLResponse {
+async fn execute_graphql(
+    state: AppState,
+    current_user: Option<Extension<CurrentUser>>,
+    req: GraphQLRequest,
+) -> GraphQLResponse {
     let mut request = req.into_inner();
-    request = request.data(state.current_user.clone());
+    if let Some(Extension(user)) = current_user {
+        request = request.data(user);
+    }
     state.schema.execute(request).await.into()
 }
 
-async fn load_default_user(db: &DatabaseConnection) -> anyhow::Result<CurrentUser> {
-    let user = app_user::Entity::find()
+async fn load_default_user(db: &DatabaseConnection) -> anyhow::Result<Option<CurrentUser>> {
+    let user = match app_user::Entity::find()
         .order_by_asc(app_user::Column::CreatedAt)
         .one(db)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("no users found; run seeds first"))?;
-    let roles = user_role::Entity::find()
-        .filter(user_role::Column::UserId.eq(user.id))
-        .all(db)
-        .await?
-        .into_iter()
-        .filter_map(|row| match row.role {
-            user_role::Role::Owner => Some(UserRole::Owner),
-            user_role::Role::Admin => Some(UserRole::Admin),
-            user_role::Role::Sales => Some(UserRole::Sales),
-            user_role::Role::Viewer => Some(UserRole::Viewer),
-        })
-        .collect();
-    Ok(CurrentUser {
-        user_id: user.id,
-        roles,
-    })
+    {
+        Some(user) => user,
+        None => return Ok(None),
+    };
+    Ok(load_current_user(db, user.id).await)
 }
 
 async fn graphiql() -> (axum::http::HeaderMap, String) {
@@ -289,4 +310,247 @@ async fn seed(db: &DatabaseConnection) -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+async fn auth_middleware(
+    State(state): State<AppState>,
+    mut req: AxumRequest<Body>,
+    next: Next,
+) -> Response {
+    let mut refresh_cookie: Option<String> = None;
+    match state.auth.mode {
+        AuthMode::Disabled => {
+            if let Some(dev) = &state.dev_user {
+                req.extensions_mut().insert(dev.clone());
+            }
+        }
+        AuthMode::Local => {
+            if let Some(token) = extract_session_token(req.headers()) {
+                if let Ok(claims) = decode_session_token(&token, &state.auth) {
+                    if let Some(user) = load_current_user(state.db.as_ref(), claims.sub).await {
+                        req.extensions_mut().insert(user.clone());
+                        if let Ok(new_token) = issue_session_token(user.user_id, &state.auth) {
+                            refresh_cookie = Some(build_session_cookie(
+                                &new_token,
+                                state.auth.session_ttl_minutes,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut response = next.run(req).await;
+    if let Some(cookie) = refresh_cookie {
+        if let Ok(value) = cookie.parse() {
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, value);
+        }
+    }
+    response
+}
+
+fn extract_session_token(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(axum::http::header::COOKIE)?;
+    let value = raw.to_str().ok()?;
+    for part in value.split(';') {
+        let trimmed = part.trim();
+        if let Some(rest) = trimmed.strip_prefix(SESSION_COOKIE) {
+            let token = rest.trim_start_matches('=').trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn load_current_user(db: &DatabaseConnection, user_id: Uuid) -> Option<CurrentUser> {
+    let user = app_user::Entity::find_by_id(user_id).one(db).await.ok()??;
+    if !user.is_active {
+        return None;
+    }
+    let roles = user_role::Entity::find()
+        .filter(user_role::Column::UserId.eq(user_id))
+        .all(db)
+        .await
+        .ok()?
+        .into_iter()
+        .filter_map(|row| match row.role {
+            user_role::Role::Owner => Some(UserRole::Owner),
+            user_role::Role::Admin => Some(UserRole::Admin),
+            user_role::Role::Sales => Some(UserRole::Sales),
+            user_role::Role::Viewer => Some(UserRole::Viewer),
+        })
+        .collect();
+    Some(CurrentUser { user_id, roles })
+}
+
+fn load_auth_config_from_env() -> anyhow::Result<AuthConfig> {
+    let mode = match std::env::var("AUTH_MODE")
+        .unwrap_or_else(|_| "disabled".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "local" => AuthMode::Local,
+        _ => AuthMode::Disabled,
+    };
+    let ttl = std::env::var("AUTH_SESSION_TTL_MINUTES")
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(15);
+    let secret = std::env::var("AUTH_SESSION_SECRET").ok();
+    if mode == AuthMode::Local && secret.is_none() {
+        anyhow::bail!("AUTH_SESSION_SECRET must be set when AUTH_MODE=local");
+    }
+    Ok(AuthConfig::new(mode, secret, ttl))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    mod common {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../api/tests/common/mod.rs"
+        ));
+    }
+    use common::PgTestContext;
+
+    #[tokio::test]
+    async fn login_logout_and_me_flow() {
+        let Some(ctx) = PgTestContext::new_seeded_with_mode(AuthMode::Local).await else {
+            eprintln!("skipping auth server test: TEST_DATABASE_URL not set");
+            return;
+        };
+        let AppSchema(schema) = build_schema(ctx.db.clone(), ctx.auth.clone());
+        let state = AppState {
+            schema,
+            db: ctx.db.clone(),
+            auth: ctx.auth.clone(),
+            dev_user: None,
+        };
+        let app = app_router(state);
+
+        let login_body = json_request(
+            r#"
+            mutation Login($email: String!, $password: String!) {
+                crm {
+                    login(email: $email, password: $password) {
+                        ok
+                    }
+                }
+            }
+            "#,
+            json!({ "email": "owner@sme.test", "password": "ownerpass" }),
+        );
+        let response = app
+            .clone()
+            .oneshot(login_body)
+            .await
+            .expect("login response");
+        let cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.to_string())
+            .expect("session cookie");
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                r#"
+                query {
+                    crm { me { email } }
+                }
+                "#,
+                json!({}),
+            ))
+            .await
+            .expect("me response");
+        let body = response_json(response).await;
+        assert!(body["data"]["crm"]["me"].is_null());
+
+        let authed_me = app
+            .clone()
+            .oneshot(add_cookie(
+                json_request(
+                    r#"
+                    query {
+                        crm { me { email } }
+                    }
+                    "#,
+                    json!({}),
+                ),
+                &cookie,
+            ))
+            .await
+            .expect("me authed");
+        let body = response_json(authed_me).await;
+        assert_eq!(
+            body["data"]["crm"]["me"]["email"].as_str(),
+            Some("owner@sme.test")
+        );
+
+        let response = app
+            .oneshot(add_cookie(
+                json_request(
+                    r#"
+                    mutation {
+                        crm { logout }
+                    }
+                    "#,
+                    json!({}),
+                ),
+                &cookie,
+            ))
+            .await
+            .expect("logout response");
+        let logout_cookie = response
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            logout_cookie.contains("Max-Age=0"),
+            "expected logout cookie, got {}",
+            logout_cookie
+        );
+
+        ctx.cleanup().await;
+    }
+
+    fn json_request(query: &str, variables: serde_json::Value) -> Request<Body> {
+        let payload = json!({ "query": query, "variables": variables }).to_string();
+        Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/graphql")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap()
+    }
+
+    fn add_cookie(mut request: Request<Body>, cookie: &str) -> Request<Body> {
+        request
+            .headers_mut()
+            .insert(axum::http::header::COOKIE, cookie.parse().unwrap());
+        request
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body collect")
+            .to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 }

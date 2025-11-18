@@ -1,4 +1,9 @@
-use crate::auth::{CurrentUser, UserRole};
+use crate::auth::{
+    build_session_cookie, clear_session_cookie, issue_session_token, AuthConfig, AuthMode,
+    CurrentUser, UserRole,
+};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use async_graphql::{
     Context, EmptySubscription, Enum, Error, ErrorExtensions, InputObject, Json, Object, Schema,
     SimpleObject, ID,
@@ -6,8 +11,9 @@ use async_graphql::{
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use entity::{
     activity, app_user, company, contact, deal, deal_stage_history, stage_meta, task,
-    user_identity, user_role,
+    user_identity, user_role, user_secret,
 };
+use rand_core::OsRng;
 use sea_orm::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, Func, OnConflict, SimpleExpr};
 use sea_orm::{
@@ -25,9 +31,10 @@ use uuid::Uuid;
 
 pub struct AppSchema(pub Schema<QueryRoot, MutationRoot, EmptySubscription>);
 
-pub fn build_schema(db: Arc<DatabaseConnection>) -> AppSchema {
+pub fn build_schema(db: Arc<DatabaseConnection>, auth: Arc<AuthConfig>) -> AppSchema {
     let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
         .data(db)
+        .data(auth)
         .finish();
     AppSchema(schema)
 }
@@ -82,11 +89,13 @@ pub struct CrmMutation;
 
 #[Object]
 impl CrmQuery {
-    async fn me(&self, ctx: &Context<'_>) -> async_graphql::Result<UserNode> {
-        let viewer = current_user(ctx)?;
+    async fn me(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<UserNode>> {
         let db = database(ctx)?;
-        let (model, roles) = load_user_with_roles(db.as_ref(), viewer.user_id).await?;
-        Ok(UserNode::from_model(model, roles))
+        if let Ok(viewer) = ctx.data::<CurrentUser>() {
+            let (model, roles) = load_user_with_roles(db.as_ref(), viewer.user_id).await?;
+            return Ok(Some(UserNode::from_model(model, roles)));
+        }
+        Ok(None)
     }
 
     async fn users(
@@ -550,6 +559,82 @@ impl CrmQuery {
 
 #[Object]
 impl CrmMutation {
+    async fn login(
+        &self,
+        ctx: &Context<'_>,
+        email: String,
+        password: String,
+    ) -> async_graphql::Result<AuthPayload> {
+        let auth = auth_config(ctx)?;
+        if auth.mode != AuthMode::Local {
+            return Ok(AuthPayload {
+                ok: false,
+                user: None,
+                error: Some("Authentication is disabled".into()),
+            });
+        }
+        let db = database(ctx)?;
+        let normalized = normalize_email(&email)?;
+        let identity = user_identity::Entity::find()
+            .filter(user_identity::Column::Provider.eq("local"))
+            .filter(user_identity::Column::Subject.eq(normalized.clone()))
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        let Some(identity) = identity else {
+            return Ok(AuthPayload {
+                ok: false,
+                user: None,
+                error: Some("Invalid credentials".into()),
+            });
+        };
+        let user = app_user::Entity::find_by_id(identity.user_id)
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        let Some(user) = user else {
+            return Ok(AuthPayload {
+                ok: false,
+                user: None,
+                error: Some("Invalid credentials".into()),
+            });
+        };
+        if !user.is_active {
+            return Ok(AuthPayload {
+                ok: false,
+                user: None,
+                error: Some("Account disabled".into()),
+            });
+        }
+        let secret = user_secret::Entity::find_by_id(user.id)
+            .one(db.as_ref())
+            .await
+            .map_err(db_error)?;
+        let Some(secret) = secret else {
+            return Ok(AuthPayload {
+                ok: false,
+                user: None,
+                error: Some("Invalid credentials".into()),
+            });
+        };
+        verify_password(&password, &secret.password_hash)?;
+        let roles = load_roles(db.as_ref(), user.id).await?;
+        let token = issue_session_token(user.id, &auth)
+            .map_err(|_| error_with_code("INTERNAL", "Failed to issue session"))?;
+        let cookie = build_session_cookie(&token, auth.session_ttl_minutes);
+        ctx.append_http_header("Set-Cookie", cookie);
+        Ok(AuthPayload {
+            ok: true,
+            user: Some(UserNode::from_model(user, roles)),
+            error: None,
+        })
+    }
+
+    async fn logout(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {
+        ctx.append_http_header("Set-Cookie", clear_session_cookie());
+        Ok(true)
+    }
+
     #[graphql(name = "assignCompany")]
     async fn assign_company(
         &self,
@@ -1297,6 +1382,13 @@ impl UserNode {
     }
 }
 
+#[derive(Clone, Debug, SimpleObject, Default)]
+pub struct AuthPayload {
+    pub ok: bool,
+    pub user: Option<UserNode>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, SimpleObject)]
 pub struct PipelineStage {
     pub key: String,
@@ -1542,6 +1634,12 @@ fn database(ctx: &Context<'_>) -> async_graphql::Result<Arc<DatabaseConnection>>
         .map_err(|_| error_with_code("INTERNAL", "Missing database connection"))
 }
 
+fn auth_config(ctx: &Context<'_>) -> async_graphql::Result<Arc<AuthConfig>> {
+    ctx.data::<Arc<AuthConfig>>()
+        .cloned()
+        .map_err(|_| error_with_code("INTERNAL", "Missing auth configuration"))
+}
+
 fn current_user(ctx: &Context<'_>) -> async_graphql::Result<CurrentUser> {
     ctx.data::<CurrentUser>()
         .cloned()
@@ -1594,12 +1692,25 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         "owner@sme.test",
         "Owner One",
         &[user_role::Role::Owner, user_role::Role::Admin],
+        "ownerpass",
     )
     .await?;
-    let admin =
-        insert_seed_user(db, "admin@sme.test", "Admin Ada", &[user_role::Role::Admin]).await?;
-    let sales =
-        insert_seed_user(db, "sales@sme.test", "Sales Sam", &[user_role::Role::Sales]).await?;
+    let admin = insert_seed_user(
+        db,
+        "admin@sme.test",
+        "Admin Ada",
+        &[user_role::Role::Admin],
+        "adminpass",
+    )
+    .await?;
+    let sales = insert_seed_user(
+        db,
+        "sales@sme.test",
+        "Sales Sam",
+        &[user_role::Role::Sales],
+        "salespass",
+    )
+    .await?;
     let acme = company::ActiveModel {
         id: Set(Uuid::new_v4()),
         name: Set("ACME, Inc.".into()),
@@ -1890,6 +2001,7 @@ async fn insert_seed_user(
     email: &str,
     display_name: &str,
     roles: &[user_role::Role],
+    password: &str,
 ) -> Result<app_user::Model, DbErr> {
     let now: DateTimeWithTimeZone = Utc::now().into();
     let model = app_user::ActiveModel {
@@ -1909,6 +2021,13 @@ async fn insert_seed_user(
         provider: Set("local".into()),
         subject: Set(email.to_string()),
         created_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+    user_secret::ActiveModel {
+        user_id: Set(model.id),
+        password_hash: Set(hash_password(password)?),
+        updated_at: Set(now),
     }
     .insert(db)
     .await?;
@@ -2947,6 +3066,30 @@ fn apply_task_ordering(mut query: Select<task::Entity>, order: TaskOrder) -> Sel
         }
     }
     query
+}
+
+fn normalize_email(value: &str) -> async_graphql::Result<String> {
+    let trimmed = value.trim().to_lowercase();
+    if trimmed.is_empty() || !trimmed.contains('@') {
+        return Err(validation_error("Invalid email address"));
+    }
+    Ok(trimmed)
+}
+
+fn hash_password(password: &str) -> Result<String, DbErr> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|err| DbErr::Custom(format!("hash error: {}", err)))
+}
+
+fn verify_password(password: &str, hashed: &str) -> async_graphql::Result<()> {
+    let parsed = PasswordHash::new(hashed)
+        .map_err(|_| error_with_code("INTERNAL", "Invalid password hash"))?;
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .map_err(|_| error_with_code("FORBIDDEN", "Invalid credentials"))
 }
 
 fn priority_order_expr() -> SimpleExpr {

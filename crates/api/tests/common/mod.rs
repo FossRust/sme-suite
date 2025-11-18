@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use api::schema::{build_schema, seed_crm_demo, AppSchema, SeededCrmRecords};
+use api::{
+    auth::{AuthConfig, AuthMode},
+    schema::{build_schema, seed_crm_demo, AppSchema, SeededCrmRecords},
+};
 use async_graphql::Schema;
 use migration::Migrator;
 use migration::MigratorTrait;
@@ -10,15 +13,29 @@ use uuid::Uuid;
 
 pub struct PgTestContext {
     pub db: Arc<DatabaseConnection>,
+    #[allow(dead_code)]
     pub schema:
         Schema<api::schema::QueryRoot, api::schema::MutationRoot, async_graphql::EmptySubscription>,
+    #[allow(dead_code)]
     pub seeded: SeededCrmRecords,
+    #[allow(dead_code)]
+    pub auth: Arc<AuthConfig>,
     admin_url: String,
     db_name: String,
 }
 
 impl PgTestContext {
+    #[allow(dead_code)]
     pub async fn new_seeded() -> Option<Self> {
+        Self::new_with_mode(AuthMode::Disabled).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn new_seeded_with_mode(mode: AuthMode) -> Option<Self> {
+        Self::new_with_mode(mode).await
+    }
+
+    async fn new_with_mode(mode: AuthMode) -> Option<Self> {
         let base = std::env::var("TEST_DATABASE_URL").ok()?;
         let (admin_url, db_name, test_url) = build_urls(&base)?;
         let admin = Database::connect(&admin_url).await.ok()?;
@@ -38,11 +55,17 @@ impl PgTestContext {
         Migrator::up(&conn, None).await.ok()?;
         let seeded = seed_crm_demo(&conn).await.ok()?;
         let db = Arc::new(conn);
-        let AppSchema(schema) = build_schema(db.clone());
+        let secret = match mode {
+            AuthMode::Local => Some("test-secret".to_string()),
+            AuthMode::Disabled => None,
+        };
+        let auth = Arc::new(AuthConfig::new(mode, secret, 15));
+        let AppSchema(schema) = build_schema(db.clone(), auth.clone());
         Some(Self {
             db,
             schema,
             seeded,
+            auth,
             admin_url,
             db_name,
         })
