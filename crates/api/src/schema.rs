@@ -1,13 +1,16 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_graphql::{
     Context, EmptySubscription, Enum, Error, ErrorExtensions, InputObject, Json, Object, Schema,
     SimpleObject, ID,
 };
-use chrono::{DateTime, NaiveDate, Utc};
-use entity::{activity, company, contact, deal, deal_stage_history, task};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
+use entity::{activity, company, contact, deal, deal_stage_history, stage_meta, task};
 use sea_orm::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::{Expr, Func, SimpleExpr};
+use sea_orm::sea_query::{Expr, Func, OnConflict, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend,
     DatabaseConnection, DbErr, EntityTrait, FromQueryResult, Order, QueryFilter, QueryOrder,
@@ -329,6 +332,173 @@ impl CrmQuery {
             .await
             .map_err(db_error)?;
         Ok(record.map(TaskNode::from))
+    }
+
+    async fn pipeline_stages(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<PipelineStage>> {
+        let db = database(ctx)?;
+        let stages = load_stage_meta(db.as_ref()).await?;
+        Ok(stages.iter().map(PipelineStage::from).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn pipeline_board(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(name = "firstPerStage")] first_per_stage: Option<i32>,
+        #[graphql(name = "stageKeys")] stage_keys: Option<Vec<String>>,
+        #[graphql(name = "companyId")] company_id: Option<ID>,
+        q: Option<String>,
+        #[graphql(name = "orderByUpdated")] order_by_updated: Option<bool>,
+    ) -> async_graphql::Result<PipelineBoard> {
+        let db = database(ctx)?;
+        let requested = first_per_stage.unwrap_or(25);
+        if requested < 0 {
+            return Err(validation_error("firstPerStage must be non-negative"));
+        }
+        if requested > 100 {
+            return Err(error_with_code(
+                "LIMIT_EXCEEDED",
+                "firstPerStage cannot exceed 100",
+            ));
+        }
+        let company_filter = match company_id {
+            Some(id) => Some(parse_uuid(&id)?),
+            None => None,
+        };
+        let query_filter = sanitize_optional_filter(q);
+        let order_by_updated = order_by_updated.unwrap_or(true);
+        let has_stage_filter = stage_keys.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
+        let span = info_span!(
+            "crm.pipelineBoard",
+            first = requested,
+            has_stage_filter,
+            has_company = company_filter.is_some(),
+            has_q = query_filter.is_some(),
+            order_by_updated
+        );
+        let _guard = span.enter();
+        let stages = load_stage_meta(db.as_ref()).await?;
+        if stages.is_empty() {
+            return Ok(PipelineBoard {
+                columns: vec![],
+                total_count: 0,
+                total_amount_cents: Some(0),
+                total_expected_cents: Some(0),
+            });
+        }
+        let stage_sequence = select_stage_sequence(&stages, stage_keys.as_ref())?;
+        if stage_sequence.is_empty() {
+            return Ok(PipelineBoard {
+                columns: vec![],
+                total_count: 0,
+                total_amount_cents: Some(0),
+                total_expected_cents: Some(0),
+            });
+        }
+        let totals =
+            query_pipeline_stage_totals(db.as_ref(), company_filter, query_filter.as_deref())
+                .await?;
+        let totals_map: HashMap<String, StageAggregateRow> = totals
+            .into_iter()
+            .map(|row| (row.stage_key.clone(), row))
+            .collect();
+        let mut columns: Vec<PipelineColumn> = Vec::new();
+        for stage in stage_sequence {
+            let totals_row = totals_map.get(&stage.key);
+            let deals = if requested == 0 {
+                vec![]
+            } else {
+                query_stage_deals(
+                    db.as_ref(),
+                    &stage.key,
+                    company_filter,
+                    query_filter.as_deref(),
+                    order_by_updated,
+                    requested as u64,
+                )
+                .await?
+            };
+            let column = PipelineColumn {
+                stage: PipelineStage::from(&stage),
+                total_count: totals_row.map(|row| row.total_count as i32).unwrap_or(0),
+                total_amount_cents: Some(totals_row.map(|row| row.total_amount_cents).unwrap_or(0)),
+                expected_value_cents: Some(
+                    totals_row.map(|row| row.total_expected_cents).unwrap_or(0),
+                ),
+                deals,
+            };
+            columns.push(column);
+        }
+        let total_count: i32 = columns.iter().map(|col| col.total_count).sum();
+        let total_amount_cents: i64 = columns
+            .iter()
+            .map(|col| col.total_amount_cents.unwrap_or(0))
+            .sum();
+        let total_expected_cents: i64 = columns
+            .iter()
+            .map(|col| col.expected_value_cents.unwrap_or(0))
+            .sum();
+        Ok(PipelineBoard {
+            columns,
+            total_count,
+            total_amount_cents: Some(total_amount_cents),
+            total_expected_cents: Some(total_expected_cents),
+        })
+    }
+
+    async fn pipeline_report(
+        &self,
+        ctx: &Context<'_>,
+        range: DateRange,
+        group: Option<TimeGroup>,
+        #[graphql(name = "includeLost")] include_lost: Option<bool>,
+    ) -> async_graphql::Result<PipelineReport> {
+        if range.from > range.to {
+            return Err(validation_error("range.from must be on or before range.to"));
+        }
+        let grouping = group.unwrap_or(TimeGroup::Month);
+        if grouping != TimeGroup::Month {
+            return Err(validation_error("Only MONTH grouping is supported"));
+        }
+        let include_lost = include_lost.unwrap_or(false);
+        let db = database(ctx)?;
+        let span = info_span!(
+            "crm.pipelineReport",
+            from = range.from.to_string(),
+            to = range.to.to_string(),
+            include_lost
+        );
+        let _guard = span.enter();
+        let stages = load_stage_meta(db.as_ref()).await?;
+        let stage_rows = query_report_stage_totals(db.as_ref(), &range, include_lost).await?;
+        let stage_row_map: HashMap<String, StageReportRow> = stage_rows
+            .into_iter()
+            .map(|row| (row.stage_key.clone(), row))
+            .collect();
+        let mut stage_totals = Vec::new();
+        for stage in stages.iter() {
+            if let Some(row) = stage_row_map.get(&stage.key) {
+                stage_totals.push(StageTotals {
+                    stage: PipelineStage::from(stage),
+                    count: row.total_count as i32,
+                    amount_cents: Some(row.amount_cents),
+                    expected_cents: Some(row.expected_cents),
+                });
+            }
+        }
+        let forecast_rows = query_forecast_points(db.as_ref(), &range, include_lost).await?;
+        let forecast = build_forecast_points(&range, forecast_rows);
+        let velocity_rows = query_velocity_rows(db.as_ref(), &range).await?;
+        let velocity = compute_velocity_stats(velocity_rows);
+
+        Ok(PipelineReport {
+            stage_totals,
+            forecast,
+            velocity,
+        })
     }
 }
 
@@ -879,6 +1049,140 @@ impl From<activity::Model> for ActivityNode {
     }
 }
 
+#[derive(Clone, Debug, SimpleObject)]
+pub struct PipelineStage {
+    pub key: String,
+    #[graphql(name = "displayName")]
+    pub display_name: String,
+    #[graphql(name = "sortOrder")]
+    pub sort_order: i32,
+    pub probability: i32,
+    #[graphql(name = "isWon")]
+    pub is_won: bool,
+    #[graphql(name = "isLost")]
+    pub is_lost: bool,
+}
+
+impl From<&stage_meta::Model> for PipelineStage {
+    fn from(model: &stage_meta::Model) -> Self {
+        Self {
+            key: model.key.clone(),
+            display_name: model.display_name.clone(),
+            sort_order: model.sort_order as i32,
+            probability: model.probability as i32,
+            is_won: model.is_won,
+            is_lost: model.is_lost,
+        }
+    }
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct PipelineDeal {
+    pub id: ID,
+    pub title: String,
+    #[graphql(name = "amountCents")]
+    pub amount_cents: Option<i64>,
+    pub currency: Option<String>,
+    #[graphql(name = "stageKey")]
+    pub stage_key: String,
+    #[graphql(name = "companyId")]
+    pub company_id: ID,
+    #[graphql(name = "companyName")]
+    pub company_name: Option<String>,
+    #[graphql(name = "expectedClose")]
+    pub expected_close: Option<NaiveDate>,
+    #[graphql(name = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct PipelineColumn {
+    pub stage: PipelineStage,
+    #[graphql(name = "totalCount")]
+    pub total_count: i32,
+    #[graphql(name = "totalAmountCents")]
+    pub total_amount_cents: Option<i64>,
+    #[graphql(name = "expectedValueCents")]
+    pub expected_value_cents: Option<i64>,
+    pub deals: Vec<PipelineDeal>,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct PipelineBoard {
+    pub columns: Vec<PipelineColumn>,
+    #[graphql(name = "totalCount")]
+    pub total_count: i32,
+    #[graphql(name = "totalAmountCents")]
+    pub total_amount_cents: Option<i64>,
+    #[graphql(name = "totalExpectedCents")]
+    pub total_expected_cents: Option<i64>,
+}
+
+#[derive(Clone, Debug, InputObject)]
+pub struct DateRange {
+    pub from: NaiveDate,
+    pub to: NaiveDate,
+}
+
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum TimeGroup {
+    #[graphql(name = "MONTH")]
+    Month,
+    #[graphql(name = "WEEK")]
+    Week,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct StageTotals {
+    pub stage: PipelineStage,
+    pub count: i32,
+    #[graphql(name = "amountCents")]
+    pub amount_cents: Option<i64>,
+    #[graphql(name = "expectedCents")]
+    pub expected_cents: Option<i64>,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct ForecastPoint {
+    pub period: String,
+    #[graphql(name = "amountCents")]
+    pub amount_cents: Option<i64>,
+    #[graphql(name = "expectedCents")]
+    pub expected_cents: Option<i64>,
+    pub deals: i32,
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct VelocityStats {
+    #[graphql(name = "dealsWon")]
+    pub deals_won: i32,
+    #[graphql(name = "avgDaysToWin")]
+    pub avg_days_to_win: f64,
+    #[graphql(name = "p50DaysToWin")]
+    pub p50_days_to_win: f64,
+    #[graphql(name = "p90DaysToWin")]
+    pub p90_days_to_win: f64,
+}
+
+impl Default for VelocityStats {
+    fn default() -> Self {
+        Self {
+            deals_won: 0,
+            avg_days_to_win: 0.0,
+            p50_days_to_win: 0.0,
+            p90_days_to_win: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, SimpleObject)]
+pub struct PipelineReport {
+    #[graphql(name = "stageTotals")]
+    pub stage_totals: Vec<StageTotals>,
+    pub forecast: Vec<ForecastPoint>,
+    pub velocity: VelocityStats,
+}
+
 #[derive(Debug)]
 pub enum StageMoveError {
     NotFound,
@@ -1028,14 +1332,15 @@ impl SeededCrmRecords {
 }
 
 pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, DbErr> {
-    let now: DateTimeWithTimeZone = Utc::now().into();
+    ensure_stage_meta_defaults(db).await?;
+    let seeded_at: DateTimeWithTimeZone = Utc::now().into();
     let acme = company::ActiveModel {
         id: Set(Uuid::new_v4()),
         name: Set("ACME, Inc.".into()),
         website: Set(Some("https://acme.test".into())),
         phone: Set(Some("+1-555-0100".into())),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(seeded_at),
+        updated_at: Set(seeded_at),
     }
     .insert(db)
     .await?;
@@ -1045,8 +1350,8 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         name: Set("FossRust Labs".into()),
         website: Set(Some("https://fossrust.test".into())),
         phone: Set(Some("+1-555-0300".into())),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(seeded_at),
+        updated_at: Set(seeded_at),
     }
     .insert(db)
     .await?;
@@ -1056,8 +1361,8 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         name: Set("NuFlights LLC".into()),
         website: Set(Some("https://nuflights.test".into())),
         phone: Set(Some("+1-555-0200".into())),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(seeded_at),
+        updated_at: Set(seeded_at),
     }
     .insert(db)
     .await?;
@@ -1069,8 +1374,8 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         last_name: Set(Some("Lovelace".into())),
         phone: Set(Some("+1-555-0110".into())),
         company_id: Set(Some(acme.id)),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(seeded_at),
+        updated_at: Set(seeded_at),
     }
     .insert(db)
     .await?;
@@ -1082,8 +1387,8 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         last_name: Set(Some("Babbage".into())),
         phone: Set(Some("+1-555-0111".into())),
         company_id: Set(Some(acme.id)),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(seeded_at),
+        updated_at: Set(seeded_at),
     }
     .insert(db)
     .await?;
@@ -1095,8 +1400,8 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         last_name: Set(Some("Torvalds".into())),
         phone: Set(Some("+1-555-0310".into())),
         company_id: Set(Some(fossrust.id)),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(seeded_at),
+        updated_at: Set(seeded_at),
     }
     .insert(db)
     .await?;
@@ -1108,8 +1413,8 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         last_name: Set(Some("Hopper".into())),
         phone: Set(Some("+1-555-0210".into())),
         company_id: Set(Some(nuflights.id)),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(seeded_at),
+        updated_at: Set(seeded_at),
     }
     .insert(db)
     .await?;
@@ -1119,11 +1424,11 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         title: Set("ACME Pilot".into()),
         amount_cents: Set(Some(120_000)),
         currency: Set(Some("USD".into())),
-        stage: Set(deal::Stage::New),
-        close_date: Set(None),
+        stage: Set(deal::Stage::Qualify),
+        close_date: Set(Some(naive_date(2025, 1, 10))),
         company_id: Set(acme.id),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(timestamp(2024, 12, 1)),
+        updated_at: Set(timestamp(2024, 12, 15)),
     }
     .insert(db)
     .await?;
@@ -1134,10 +1439,10 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         amount_cents: Set(Some(75_000)),
         currency: Set(Some("USD".into())),
         stage: Set(deal::Stage::Proposal),
-        close_date: Set(None),
+        close_date: Set(Some(naive_date(2025, 2, 15))),
         company_id: Set(fossrust.id),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(timestamp(2024, 12, 5)),
+        updated_at: Set(timestamp(2024, 12, 20)),
     }
     .insert(db)
     .await?;
@@ -1148,34 +1453,169 @@ pub async fn seed_crm_demo(db: &DatabaseConnection) -> Result<SeededCrmRecords, 
         amount_cents: Set(Some(210_000)),
         currency: Set(Some("USD".into())),
         stage: Set(deal::Stage::Qualify),
-        close_date: Set(None),
+        close_date: Set(Some(naive_date(2025, 3, 5))),
         company_id: Set(nuflights.id),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(timestamp(2024, 12, 10)),
+        updated_at: Set(timestamp(2025, 1, 3)),
     }
     .insert(db)
     .await?;
 
-    if let Err(err) = move_deal_stage_service(
-        db,
-        acme_pilot.id,
-        deal::Stage::Qualify,
-        Some("Qualified via discovery".into()),
-        Some("seed".into()),
-    )
-    .await
-    {
-        return Err(DbErr::Custom(format!(
-            "seed stage change failed: {:?}",
-            err
-        )));
+    let retainer = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("ACME Retainer".into()),
+        amount_cents: Set(Some(60_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::Negotiate),
+        close_date: Set(Some(naive_date(2025, 2, 28))),
+        company_id: Set(acme.id),
+        created_at: Set(timestamp(2024, 12, 12)),
+        updated_at: Set(timestamp(2025, 1, 12)),
+    }
+    .insert(db)
+    .await?;
+
+    let expansion = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("FossRust Expansion".into()),
+        amount_cents: Set(Some(95_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::Won),
+        close_date: Set(Some(naive_date(2025, 1, 20))),
+        company_id: Set(fossrust.id),
+        created_at: Set(timestamp(2024, 12, 15)),
+        updated_at: Set(timestamp(2025, 1, 22)),
+    }
+    .insert(db)
+    .await?;
+
+    let quick_win = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("Quick Win".into()),
+        amount_cents: Set(Some(40_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::Won),
+        close_date: Set(Some(naive_date(2025, 2, 10))),
+        company_id: Set(acme.id),
+        created_at: Set(timestamp(2025, 1, 5)),
+        updated_at: Set(timestamp(2025, 2, 2)),
+    }
+    .insert(db)
+    .await?;
+
+    let lost_trial = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("Stalled Trial".into()),
+        amount_cents: Set(Some(25_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::Lost),
+        close_date: Set(Some(naive_date(2025, 1, 25))),
+        company_id: Set(nuflights.id),
+        created_at: Set(timestamp(2024, 12, 18)),
+        updated_at: Set(timestamp(2025, 1, 25)),
+    }
+    .insert(db)
+    .await?;
+
+    let fresh_prospect = deal::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        title: Set("Fresh Prospect".into()),
+        amount_cents: Set(Some(55_000)),
+        currency: Set(Some("USD".into())),
+        stage: Set(deal::Stage::New),
+        close_date: Set(Some(naive_date(2025, 3, 15))),
+        company_id: Set(acme.id),
+        created_at: Set(timestamp(2025, 1, 20)),
+        updated_at: Set(timestamp(2025, 1, 20)),
+    }
+    .insert(db)
+    .await?;
+
+    let won_histories = vec![
+        deal_stage_history::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            deal_id: Set(expansion.id),
+            from_stage: Set(deal::Stage::Negotiate),
+            to_stage: Set(deal::Stage::Won),
+            changed_at: Set(timestamp(2025, 1, 22)),
+            note: Set(Some("Signed master services.".into())),
+            changed_by: Set(Some("seed".into())),
+        },
+        deal_stage_history::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            deal_id: Set(quick_win.id),
+            from_stage: Set(deal::Stage::Proposal),
+            to_stage: Set(deal::Stage::Won),
+            changed_at: Set(timestamp(2025, 2, 2)),
+            note: Set(Some("Fast track approval.".into())),
+            changed_by: Set(Some("seed".into())),
+        },
+    ];
+    for history in won_histories {
+        deal_stage_history::Entity::insert(history)
+            .exec_without_returning(db)
+            .await?;
     }
 
     Ok(SeededCrmRecords {
         companies: vec![acme, fossrust, nuflights],
         contacts: vec![ada, charles, linus, grace],
-        deals: vec![acme_pilot, tooling, renewal],
+        deals: vec![
+            acme_pilot.clone(),
+            tooling.clone(),
+            renewal.clone(),
+            retainer.clone(),
+            expansion.clone(),
+            quick_win.clone(),
+            lost_trial.clone(),
+            fresh_prospect.clone(),
+        ],
     })
+}
+
+const STAGE_META_DEFAULTS: [(&str, &str, i16, i16, bool, bool); 6] = [
+    ("NEW", "New", 10, 10, false, false),
+    ("QUALIFY", "Qualify", 20, 25, false, false),
+    ("PROPOSAL", "Proposal", 30, 50, false, false),
+    ("NEGOTIATE", "Negotiate", 40, 70, false, false),
+    ("WON", "Won", 90, 100, true, false),
+    ("LOST", "Lost", 95, 0, false, true),
+];
+
+async fn ensure_stage_meta_defaults(db: &DatabaseConnection) -> Result<(), DbErr> {
+    let rows: Vec<stage_meta::ActiveModel> = STAGE_META_DEFAULTS
+        .iter()
+        .map(
+            |(key, display, order, prob, is_won, is_lost)| stage_meta::ActiveModel {
+                key: Set((*key).to_string()),
+                display_name: Set((*display).to_string()),
+                sort_order: Set(*order),
+                probability: Set(*prob),
+                is_won: Set(*is_won),
+                is_lost: Set(*is_lost),
+            },
+        )
+        .collect();
+    stage_meta::Entity::insert_many(rows)
+        .on_conflict(
+            OnConflict::column(stage_meta::Column::Key)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(db)
+        .await?;
+    Ok(())
+}
+
+fn naive_date(year: i32, month: u32, day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(year, month, day).expect("valid seed date")
+}
+
+fn timestamp(year: i32, month: u32, day: u32) -> DateTimeWithTimeZone {
+    Utc.with_ymd_and_hms(year, month, day, 12, 0, 0)
+        .single()
+        .expect("valid seed timestamp")
+        .into()
 }
 
 /// Exposed for seeders/tests to drive the same transactional logic.
@@ -1557,6 +1997,369 @@ async fn run_trgm_search(
         .into_iter()
         .filter_map(|row| SearchHit::try_from(row).ok())
         .collect())
+}
+
+async fn load_stage_meta(db: &DatabaseConnection) -> async_graphql::Result<Vec<stage_meta::Model>> {
+    stage_meta::Entity::find()
+        .order_by_asc(stage_meta::Column::SortOrder)
+        .all(db)
+        .await
+        .map_err(db_error)
+}
+
+fn sanitize_optional_filter(value: Option<String>) -> Option<String> {
+    value.and_then(|input| {
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+fn select_stage_sequence(
+    stages: &[stage_meta::Model],
+    requested: Option<&Vec<String>>,
+) -> async_graphql::Result<Vec<stage_meta::Model>> {
+    let Some(keys) = requested else {
+        return Ok(stages.to_vec());
+    };
+    if keys.is_empty() {
+        return Err(validation_error(
+            "stageKeys must contain at least one value",
+        ));
+    }
+    let mut requested_set = HashSet::new();
+    for key in keys.iter() {
+        let normalized = normalize_stage_key(key)
+            .ok_or_else(|| validation_error("stageKeys cannot contain blank values"))?;
+        requested_set.insert(normalized);
+    }
+    if requested_set.is_empty() {
+        return Err(validation_error("stageKeys cannot contain blank values"));
+    }
+    let available: HashSet<String> = stages
+        .iter()
+        .map(|stage| stage.key.to_uppercase())
+        .collect();
+    for key in requested_set.iter() {
+        if !available.contains(key) {
+            return Err(validation_error(format!("Unknown stage key {}", key)));
+        }
+    }
+    let filtered = stages
+        .iter()
+        .filter(|stage| requested_set.contains(&stage.key.to_uppercase()))
+        .cloned()
+        .collect();
+    Ok(filtered)
+}
+
+fn normalize_stage_key(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_uppercase())
+    }
+}
+
+fn deal_filter_clauses(company_id: Option<Uuid>, q: Option<&str>) -> (Vec<String>, Vec<Value>) {
+    let mut clauses = Vec::new();
+    let mut values = Vec::new();
+    if let Some(uuid) = company_id {
+        clauses.push("d.company_id = ?".to_string());
+        values.push(uuid.into());
+    }
+    if let Some(term) = q {
+        clauses.push("d.title ILIKE ?".to_string());
+        values.push(format!("%{}%", term).into());
+    }
+    (clauses, values)
+}
+
+fn where_clause(clauses: &[String]) -> String {
+    if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    }
+}
+
+#[derive(Debug, FromQueryResult)]
+struct StageAggregateRow {
+    stage_key: String,
+    total_count: i64,
+    total_amount_cents: i64,
+    total_expected_cents: i64,
+}
+
+async fn query_pipeline_stage_totals(
+    db: &DatabaseConnection,
+    company_id: Option<Uuid>,
+    q: Option<&str>,
+) -> async_graphql::Result<Vec<StageAggregateRow>> {
+    let (clauses, values) = deal_filter_clauses(company_id, q);
+    let where_sql = where_clause(&clauses);
+    let sql = format!(
+        "SELECT d.stage::text AS stage_key, COUNT(*) AS total_count,\
+         COALESCE(SUM(COALESCE(d.amount_cents, 0)), 0) AS total_amount_cents,\
+         COALESCE(SUM(((COALESCE(d.amount_cents, 0)::bigint) * sm.probability::bigint) / 100), 0) AS total_expected_cents\
+         FROM deal d\
+         JOIN stage_meta sm ON sm.key = d.stage::text\
+         {where_sql}\
+         GROUP BY d.stage"
+    );
+    let stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values);
+    StageAggregateRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .map_err(db_error)
+}
+
+#[derive(Debug, FromQueryResult)]
+struct PipelineDealRow {
+    id: Uuid,
+    title: String,
+    amount_cents: Option<i64>,
+    currency: Option<String>,
+    stage_key: String,
+    company_id: Uuid,
+    company_name: Option<String>,
+    expected_close: Option<NaiveDate>,
+    updated_at: DateTimeWithTimeZone,
+}
+
+async fn query_stage_deals(
+    db: &DatabaseConnection,
+    stage_key: &str,
+    company_id: Option<Uuid>,
+    q: Option<&str>,
+    order_by_updated: bool,
+    limit: u64,
+) -> async_graphql::Result<Vec<PipelineDeal>> {
+    let (clauses, mut values) = deal_filter_clauses(company_id, q);
+    let mut sql = String::from(
+        "SELECT d.id, d.title, d.amount_cents, d.currency,\
+         d.stage::text AS stage_key, d.company_id, c.name AS company_name,\
+         d.close_date AS expected_close, d.updated_at\
+         FROM deal d\
+         JOIN company c ON c.id = d.company_id\
+         WHERE d.stage = ?::deal_stage",
+    );
+    values.insert(0, stage_key.to_string().into());
+    if !clauses.is_empty() {
+        sql.push_str(" AND ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    let order_col = if order_by_updated {
+        "d.updated_at"
+    } else {
+        "d.created_at"
+    };
+    sql.push_str(&format!(" ORDER BY {order_col} DESC LIMIT {}", limit));
+    let stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values);
+    let rows = PipelineDealRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .map_err(db_error)?;
+    Ok(rows.into_iter().map(map_pipeline_deal).collect())
+}
+
+fn map_pipeline_deal(row: PipelineDealRow) -> PipelineDeal {
+    PipelineDeal {
+        id: ID::from(row.id.to_string()),
+        title: row.title,
+        amount_cents: row.amount_cents,
+        currency: row.currency,
+        stage_key: row.stage_key,
+        company_id: ID::from(row.company_id.to_string()),
+        company_name: row.company_name,
+        expected_close: row.expected_close,
+        updated_at: row.updated_at.into(),
+    }
+}
+
+#[derive(Debug, FromQueryResult)]
+struct StageReportRow {
+    stage_key: String,
+    total_count: i64,
+    amount_cents: i64,
+    expected_cents: i64,
+}
+
+async fn query_report_stage_totals(
+    db: &DatabaseConnection,
+    range: &DateRange,
+    include_lost: bool,
+) -> async_graphql::Result<Vec<StageReportRow>> {
+    let mut clauses = vec!["d.close_date BETWEEN ?::date AND ?::date".to_string()];
+    if !include_lost {
+        clauses.push("sm.is_lost = false".to_string());
+    }
+    let where_sql = where_clause(&clauses);
+    let sql = format!(
+        "SELECT d.stage::text AS stage_key, COUNT(*) AS total_count,\
+         COALESCE(SUM(COALESCE(d.amount_cents, 0)), 0) AS amount_cents,\
+         COALESCE(SUM(((COALESCE(d.amount_cents, 0)::bigint) * sm.probability::bigint) / 100), 0) AS expected_cents\
+         FROM deal d\
+         JOIN stage_meta sm ON sm.key = d.stage::text\
+         {where_sql}\
+         GROUP BY d.stage",
+    );
+    let values = vec![range.from.to_string().into(), range.to.to_string().into()];
+    let stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values);
+    StageReportRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .map_err(db_error)
+}
+
+#[derive(Debug, FromQueryResult)]
+struct ForecastAggregateRow {
+    period: String,
+    amount_cents: i64,
+    expected_cents: i64,
+    deals: i64,
+}
+
+async fn query_forecast_points(
+    db: &DatabaseConnection,
+    range: &DateRange,
+    include_lost: bool,
+) -> async_graphql::Result<Vec<ForecastAggregateRow>> {
+    let mut clauses = vec!["d.close_date BETWEEN ?::date AND ?::date".to_string()];
+    if !include_lost {
+        clauses.push("sm.is_lost = false".to_string());
+    }
+    let where_sql = where_clause(&clauses);
+    let sql = format!(
+        "SELECT to_char(date_trunc('month', d.close_date::timestamp), 'YYYY-MM') AS period,\
+         COALESCE(SUM(COALESCE(d.amount_cents, 0)), 0) AS amount_cents,\
+         COALESCE(SUM(((COALESCE(d.amount_cents, 0)::bigint) * sm.probability::bigint) / 100), 0) AS expected_cents,\
+         COUNT(*) AS deals\
+         FROM deal d\
+         JOIN stage_meta sm ON sm.key = d.stage::text\
+         {where_sql}\
+         GROUP BY period\
+         ORDER BY period",
+    );
+    let values = vec![range.from.to_string().into(), range.to.to_string().into()];
+    let stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values);
+    ForecastAggregateRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .map_err(db_error)
+}
+
+fn build_forecast_points(range: &DateRange, rows: Vec<ForecastAggregateRow>) -> Vec<ForecastPoint> {
+    let mut map: HashMap<String, ForecastAggregateRow> = HashMap::new();
+    for row in rows {
+        map.insert(row.period.clone(), row);
+    }
+    enumerate_months(range)
+        .into_iter()
+        .map(|month| {
+            let key = format!("{:04}-{:02}", month.year(), month.month());
+            if let Some(row) = map.get(&key) {
+                ForecastPoint {
+                    period: key,
+                    amount_cents: Some(row.amount_cents),
+                    expected_cents: Some(row.expected_cents),
+                    deals: row.deals as i32,
+                }
+            } else {
+                ForecastPoint {
+                    period: key,
+                    amount_cents: Some(0),
+                    expected_cents: Some(0),
+                    deals: 0,
+                }
+            }
+        })
+        .collect()
+}
+
+fn enumerate_months(range: &DateRange) -> Vec<NaiveDate> {
+    let mut cursor = NaiveDate::from_ymd_opt(range.from.year(), range.from.month(), 1)
+        .expect("valid start month");
+    let end =
+        NaiveDate::from_ymd_opt(range.to.year(), range.to.month(), 1).expect("valid end month");
+    let mut months = Vec::new();
+    while cursor <= end {
+        months.push(cursor);
+        cursor = next_month(cursor);
+    }
+    months
+}
+
+fn next_month(date: NaiveDate) -> NaiveDate {
+    let (year, month) = if date.month() == 12 {
+        (date.year() + 1, 1)
+    } else {
+        (date.year(), date.month() + 1)
+    };
+    NaiveDate::from_ymd_opt(year, month, 1).expect("valid next month")
+}
+
+#[derive(Debug, FromQueryResult)]
+struct VelocityRow {
+    created_at: DateTimeWithTimeZone,
+    won_at: DateTimeWithTimeZone,
+}
+
+async fn query_velocity_rows(
+    db: &DatabaseConnection,
+    range: &DateRange,
+) -> async_graphql::Result<Vec<VelocityRow>> {
+    let sql = "WITH won AS (
+            SELECT deal_id, MIN(changed_at) AS won_at
+            FROM deal_stage_history
+            WHERE to_stage = 'WON'
+            GROUP BY deal_id
+        )
+        SELECT d.created_at, won.won_at
+        FROM won
+        JOIN deal d ON d.id = won.deal_id
+        WHERE won.won_at::date BETWEEN ?::date AND ?::date";
+    let values = vec![range.from.to_string().into(), range.to.to_string().into()];
+    let stmt = Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, values);
+    VelocityRow::find_by_statement(stmt)
+        .all(db)
+        .await
+        .map_err(db_error)
+}
+
+fn compute_velocity_stats(rows: Vec<VelocityRow>) -> VelocityStats {
+    if rows.is_empty() {
+        return VelocityStats::default();
+    }
+    let mut durations: Vec<f64> = rows
+        .into_iter()
+        .map(|row| {
+            let delta = row.won_at - row.created_at;
+            delta.num_seconds() as f64 / 86_400.0
+        })
+        .collect();
+    durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let avg = durations.iter().sum::<f64>() / durations.len() as f64;
+    VelocityStats {
+        deals_won: durations.len() as i32,
+        avg_days_to_win: avg,
+        p50_days_to_win: percentile(&durations, 0.5),
+        p90_days_to_win: percentile(&durations, 0.9),
+    }
+}
+
+fn percentile(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let clamped = percentile.clamp(0.0, 1.0);
+    let rank = (clamped * values.len() as f64).ceil().max(1.0) as usize - 1;
+    let idx = rank.min(values.len() - 1);
+    values[idx]
 }
 
 fn validate_task_title(value: &str) -> async_graphql::Result<String> {

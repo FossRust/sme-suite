@@ -4,4 +4,5 @@ pub mod contact;
 pub mod deal;
 pub mod deal_stage_history;
 pub mod prelude;
+pub mod stage_meta;
 pub mod task;
